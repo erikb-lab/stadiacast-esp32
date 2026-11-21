@@ -884,6 +884,59 @@ static const uint8_t *strip_rtp_header(const uint8_t *data, size_t len, size_t *
     return data + off;
 }
 
+static inline int32_t pbw_zigzag32(uint32_t n) {
+    return (int32_t)((n >> 1) ^ (~(n & 1u) + 1u));
+}
+
+typedef struct {
+    uint32_t id;
+    uint32_t buttons;
+    int32_t  lx, ly, rx, ry;
+    uint32_t lt, rt;
+    bool     is_reg;
+} fast_gamepad_v2_t;
+
+static bool parse_gamepad_v2_fast(const uint8_t *buf, size_t len, fast_gamepad_v2_t *out) {
+    memset(out, 0, sizeof(*out));
+    size_t off = 0;
+    while (off < len) {
+        uint64_t tag = 0;
+        if (!pbw_read_varint(buf, len, &off, &tag)) return false;
+        uint32_t fn = (uint32_t)(tag >> 3);
+        uint32_t wt = (uint32_t)(tag & 7u);
+        if (wt == 0) {
+            uint64_t v = 0;
+            if (!pbw_read_varint(buf, len, &off, &v)) return false;
+            switch (fn) {
+            case 1:  out->id = (uint32_t)v; break;
+            case 2:  out->buttons = (uint32_t)v; break;
+            case 3:  out->lx = pbw_zigzag32((uint32_t)v); break;
+            case 4:  out->ly = pbw_zigzag32((uint32_t)v); break;
+            case 5:  out->rx = pbw_zigzag32((uint32_t)v); break;
+            case 6:  out->ry = pbw_zigzag32((uint32_t)v); break;
+            case 7:  out->lt = (uint32_t)v; break;
+            case 8:  out->rt = (uint32_t)v; break;
+            case 16: if (v != 0) out->is_reg = true; break; /* device_presence */
+            default: break;
+            }
+        } else if (wt == 1) {
+            if (off + 8 > len) return false;
+            off += 8;
+        } else if (wt == 2) {
+            uint64_t flen = 0;
+            if (!pbw_read_varint(buf, len, &off, &flen) || off + flen > len) return false;
+            if (fn == 18) out->is_reg = true; /* registration_info */
+            off += (size_t)flen;
+        } else if (wt == 5) {
+            if (off + 4 > len) return false;
+            off += 4;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len) {
     const uint8_t *pb_data = payload;
     size_t pb_len = len;
@@ -898,58 +951,85 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         was_rtp = true;
     }
 
-    chrome_cloudcast_streaming_InputProtocolMessage *ipm = calloc(1, sizeof(*ipm));
-    if (!ipm) return;
-    pb_istream_t is = pb_istream_from_buffer(pb_data, pb_len);
-    bool decoded = pb_decode(&is, chrome_cloudcast_streaming_InputProtocolMessage_fields, ipm);
-    if (!decoded && was_rtp) {
-        /* Fallback: bare InputProtocolMessage */
-        memset(ipm, 0, sizeof(*ipm));
-        is = pb_istream_from_buffer(payload, len);
-        decoded = pb_decode(&is, chrome_cloudcast_streaming_InputProtocolMessage_fields, ipm);
+    /* Field 7 of InputProtocolMessage = input_message_series */
+    const uint8_t *ser = NULL;
+    size_t ser_len = 0;
+    if (!pbw_find_bytes(pb_data, pb_len, 7, &ser, &ser_len)) {
+        if (!was_rtp || !pbw_find_bytes(payload, len, 7, &ser, &ser_len)) return;
         was_rtp = false;
     }
-    if (decoded && ipm->has_input_message_series) {
-        const chrome_cloudcast_streaming_InputMessageSeries *s = &ipm->input_message_series;
-        if (L == &g_game) {
-            g_game_use_rtp = was_rtp;
-            if (s->session_id[0]) {
-                snprintf(g_game_session_id, sizeof(g_game_session_id), "%.63s", s->session_id);
-            }
-        }
-        const chrome_cloudcast_streaming_GamepadMessage_V2 *latest_g = NULL;
-        for (pb_size_t i = 0; i < s->messages_count; i++) {
-            if (s->messages[i].has_gamepad_message_v2) {
-                const chrome_cloudcast_streaming_GamepadMessage_V2 *g = &s->messages[i].gamepad_message_v2;
-                if (g->has_registration_info || g->device_presence) {
-                    if (g->id > 0) g_game_pad_id = g->id;
-                    continue;
+
+    if (L == &g_game) g_game_use_rtp = was_rtp;
+
+    uint64_t seq_num = 0;
+    fast_gamepad_v2_t latest_g = {0};
+    bool have_g = false;
+
+    size_t off = 0;
+    while (off < ser_len) {
+        uint64_t tag = 0;
+        if (!pbw_read_varint(ser, ser_len, &off, &tag)) break;
+        uint32_t fn = (uint32_t)(tag >> 3);
+        uint32_t wt = (uint32_t)(tag & 7u);
+        if (wt == 0) {
+            uint64_t v = 0;
+            if (!pbw_read_varint(ser, ser_len, &off, &v)) break;
+            if (fn == 2) seq_num = v; /* sequence_number */
+        } else if (wt == 1) {
+            if (off + 8 > ser_len) break;
+            off += 8;
+        } else if (wt == 2) {
+            uint64_t flen = 0;
+            if (!pbw_read_varint(ser, ser_len, &off, &flen) || off + flen > ser_len) break;
+            const uint8_t *fptr = ser + off;
+            off += (size_t)flen;
+            if (fn == 1 && L == &g_game && flen > 0) {
+                /* session_id */
+                size_t cpy = flen < sizeof(g_game_session_id) - 1 ? (size_t)flen : sizeof(g_game_session_id) - 1;
+                memcpy(g_game_session_id, fptr, cpy);
+                g_game_session_id[cpy] = '\0';
+            } else if (fn == 4) {
+                /* InputMessageSlim -> field 5 = gamepad_message_v2 */
+                const uint8_t *gp = NULL;
+                size_t gp_len = 0;
+                if (pbw_find_bytes(fptr, (size_t)flen, 5, &gp, &gp_len)) {
+                    fast_gamepad_v2_t g;
+                    if (parse_gamepad_v2_fast(gp, gp_len, &g)) {
+                        if (g.id > 0) g_game_pad_id = g.id;
+                        if (!g.is_reg) {
+                            latest_g = g;
+                            have_g = true;
+                        }
+                    }
                 }
-                if (g->id > 0) g_game_pad_id = g->id;
-                latest_g = g;
             }
-        }
-        if (latest_g) {
-            dispatch_input(latest_g->buttons, latest_g->axis_left_x, latest_g->axis_left_y,
-                           latest_g->axis_right_x, latest_g->axis_right_y,
-                           latest_g->trigger_left, latest_g->trigger_right);
-        }
-        /* Ack sequence_number (field 4 = ack_sequence_number in InputProtocolMessage) */
-        uint8_t ack[16];
-        size_t al = pbw_put_u64(ack, sizeof(ack), 4, s->sequence_number);
-        if (was_rtp) {
-            uint8_t rtp[12 + 16];
-            uint16_t seq = ++g_game_rtp_seq;
-            rtp[0] = 0x80; rtp[1] = 96;
-            rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
-            memset(rtp + 4, 0, 8);
-            memcpy(rtp + 12, ack, al);
-            link_send_wire(L, WIRE_ID_RTP, rtp, 12 + al);
+        } else if (wt == 5) {
+            if (off + 4 > ser_len) break;
+            off += 4;
         } else {
-            link_send_wire(L, WIRE_ID_RTP, ack, al);
+            break;
         }
     }
-    free(ipm);
+
+    if (have_g) {
+        dispatch_input(latest_g.buttons, latest_g.lx, latest_g.ly,
+                       latest_g.rx, latest_g.ry, latest_g.lt, latest_g.rt);
+    }
+
+    /* Ack sequence_number (field 4 = ack_sequence_number in InputProtocolMessage) */
+    uint8_t ack[16];
+    size_t al = pbw_put_u64(ack, sizeof(ack), 4, seq_num);
+    if (was_rtp) {
+        uint8_t rtp[12 + 16];
+        uint16_t seq = ++g_game_rtp_seq;
+        rtp[0] = 0x80; rtp[1] = 96;
+        rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
+        memset(rtp + 4, 0, 8);
+        memcpy(rtp + 12, ack, al);
+        link_send_wire(L, WIRE_ID_RTP, rtp, 12 + al);
+    } else {
+        link_send_wire(L, WIRE_ID_RTP, ack, al);
+    }
 }
 
 static void handle_app_data(dtls_link_t *L, const uint8_t *data, size_t len) {
