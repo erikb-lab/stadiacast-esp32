@@ -173,10 +173,20 @@ void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
     g_remote_updated = true;
 }
 
+static int g_wake_sock = -1;
+
 void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
     g_rumble_left_req = left_strong;
     g_rumble_right_req = right_weak;
     g_rumble_dirty = true;
+    if (g_wake_sock >= 0) {
+        struct sockaddr_in lo = {0};
+        lo.sin_family = AF_INET;
+        lo.sin_port = htons(GAME_UDP_PORT);
+        lo.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        uint8_t b = 0xFF;
+        sendto(g_wake_sock, &b, 1, 0, (const struct sockaddr *)&lo, sizeof(lo));
+    }
 }
 
 /* ---------- Minimal Protobuf Wire Helpers (bypasses 128B nanopb wrapper caps) ---------- */
@@ -1090,6 +1100,7 @@ static void service_socket(dtls_link_t *L) {
     socklen_t slen = sizeof(src);
     int n = recvfrom(L->sock, g_udp_buf, sizeof(g_udp_buf), 0, (struct sockaddr *)&src, &slen);
     if (n <= 0) return;
+    if (n == 1 && g_udp_buf[0] == 0xFF) return;
 
     if (!L->peer_seen || L->peer.sin_addr.s_addr != src.sin_addr.s_addr ||
         L->peer.sin_port != src.sin_port) {
@@ -1119,7 +1130,7 @@ static void service_timers(dtls_link_t *L) {
         pump_dtls(L);
     }
     if (L->peer_seen && L->ctrl_ufrag[0] && L->ctrl_pwd[0]) {
-        int64_t interval_us = L->dtls_seen ? 2500000 : 1000000;
+        int64_t interval_us = L->dtls_seen ? 2500000 : 250000;
         if (L->last_stun_tx_us == 0 || (now - L->last_stun_tx_us) >= interval_us) {
             L->last_stun_tx_us = now;
             stun_send_check(L);
@@ -1129,6 +1140,7 @@ static void service_timers(dtls_link_t *L) {
 
 static void stadia_transport_task(void *arg) {
     (void)arg;
+    g_wake_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (!tls_init_shared() || !link_init(&g_disp) || !link_init(&g_game)) {
         ESP_LOGE(TAG, "Transport init failed");
         vTaskDelete(NULL);
@@ -1159,7 +1171,7 @@ static void stadia_transport_task(void *arg) {
         FD_ZERO(&rfds);
         FD_SET(g_disp.sock, &rfds);
         FD_SET(g_game.sock, &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 }; /* 10 ms tick for rumble/timers */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50 ms idle tick; rumble wakes immediately */
         int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r > 0) {
             if (FD_ISSET(g_disp.sock, &rfds)) service_socket(&g_disp);
@@ -1172,8 +1184,8 @@ static void stadia_transport_task(void *arg) {
         /* Display RPC handshake: 600ms after DTLS, retry every 1.5s until READY */
         if (g_disp.handshake_done && !g_rpc_ready) {
             int64_t now = esp_timer_get_time();
-            if ((now - g_disp.dtls_done_us) >= 600000 &&
-                (g_last_state_req_us == 0 || (now - g_last_state_req_us) >= 1500000)) {
+            if ((now - g_disp.dtls_done_us) >= 150000 &&
+                (g_last_state_req_us == 0 || (now - g_last_state_req_us) >= 750000)) {
                 g_last_state_req_us = now;
                 send_get_controller_state_request();
             }
