@@ -1117,5 +1117,5 @@ static void stadia_transport_task(void *arg) {
 }
 
 void stadia_transport_init(void) {
-    xTaskCreate(stadia_transport_task, "stadia_rtc", TRANSPORT_STACK, NULL, 6, NULL);
+    xTaskCreatePinnedToCore(stadia_transport_task, "stadia_rtc", TRANSPORT_STACK, NULL, 6, NULL, 0);
 }
