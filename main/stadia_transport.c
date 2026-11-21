@@ -636,7 +636,7 @@ static void send_set_microphone(bool enable) {
 }
 
 static void service_audio_tx(void) {
-    if (!g_audio_enabled || !g_disp.srtp.keys_ready || !g_disp.peer_seen) return;
+    if (!g_audio_enabled || !g_disp.srtp.keys_ready || !g_disp.peer_seen || g_mic_rx_pkts > 0) return;
     int64_t now = esp_timer_get_time();
     if (g_audio_next_tx_us == 0) g_audio_next_tx_us = now;
     if (now < g_audio_next_tx_us) return;
@@ -1229,11 +1229,40 @@ static void service_socket(dtls_link_t *L) {
             size_t rtp_len = 0;
             if (stadia_srtp_unprotect(&L->srtp, g_udp_buf, (size_t)n, &rtp_len) &&
                 rtp_len > 12 && pt == 111) {
-                g_mic_rx_pkts++;
-                g_mic_rx_bytes += (uint32_t)(rtp_len - 12);
-                if ((g_mic_rx_pkts % 50u) == 1u) {
-                    ESP_LOGI(TAG, "Mic SRTP RX: pkts=%lu bytes=%lu",
-                             (unsigned long)g_mic_rx_pkts, (unsigned long)g_mic_rx_bytes);
+                size_t hlen = 12u + 4u * (g_udp_buf[0] & 0x0Fu);
+                if ((g_udp_buf[0] & 0x10u) && hlen + 4u <= rtp_len) {
+                    uint16_t ext_w = (uint16_t)((g_udp_buf[hlen + 2] << 8) | g_udp_buf[hlen + 3]);
+                    hlen += 4u + 4u * ext_w;
+                }
+                if (rtp_len > hlen) {
+                    size_t plen = rtp_len - hlen;
+                    g_mic_rx_pkts++;
+                    g_mic_rx_bytes += (uint32_t)plen;
+                    if (12u + plen + STADIA_SRTP_TAG_LEN <= sizeof(g_audio_tx_buf)) {
+                        uint16_t seq = g_audio_seq++;
+                        uint32_t ts  = g_audio_ts;
+                        g_audio_ts += 960;
+                        const uint32_t ssrc = 0x51A01234u;
+                        g_audio_tx_buf[0] = 0x80;
+                        g_audio_tx_buf[1] = 111;
+                        g_audio_tx_buf[2] = (uint8_t)(seq >> 8);
+                        g_audio_tx_buf[3] = (uint8_t)(seq & 0xFF);
+                        g_audio_tx_buf[4] = (uint8_t)(ts >> 24);
+                        g_audio_tx_buf[5] = (uint8_t)(ts >> 16);
+                        g_audio_tx_buf[6] = (uint8_t)(ts >> 8);
+                        g_audio_tx_buf[7] = (uint8_t)(ts & 0xFF);
+                        g_audio_tx_buf[8] = (uint8_t)(ssrc >> 24);
+                        g_audio_tx_buf[9] = (uint8_t)(ssrc >> 16);
+                        g_audio_tx_buf[10] = (uint8_t)(ssrc >> 8);
+                        g_audio_tx_buf[11] = (uint8_t)(ssrc & 0xFF);
+                        memcpy(g_audio_tx_buf + 12, g_udp_buf + hlen, plen);
+                        size_t out_len = 0;
+                        if (stadia_srtp_protect(&L->srtp, g_audio_tx_buf, 12u + plen, &out_len)) {
+                            sendto(L->sock, g_audio_tx_buf, out_len, 0,
+                                   (const struct sockaddr *)&L->peer, sizeof(L->peer));
+                            g_audio_tx_pkts++;
+                        }
+                    }
                 }
             }
         }
