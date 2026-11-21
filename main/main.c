@@ -1,3 +1,20 @@
+#include "driver/gpio.h"
+#include "esp_rom_sys.h"
+
+/* XIAO ESP32-S3 D0 = GPIO1: short to GND at power-on for Serial/Flash mode */
+static bool boot_pin_is_serial_mode(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_1,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    esp_rom_delay_us(5000);
+    return gpio_get_level(GPIO_NUM_1) == 0;
+}
+
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -30,6 +47,10 @@ void app_main(void) {
     wifi_ap_init();
     net_services_init();
     https_boot_init();
+    if (boot_pin_is_serial_mode()) {
+        printf("\n=== D0 (GPIO1) grounded -> SERIAL / FLASH MODE (USB HID disabled) ===\n");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
+    }
     usb_gamepad_init(stadia_transport_set_rumble);
     stadia_transport_init();
 

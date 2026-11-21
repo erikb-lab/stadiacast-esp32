@@ -67,6 +67,7 @@ static stadia_hid_report_t s_latest = { .hat = 8, .lx = 128, .ly = 128, .rx = 12
 static volatile bool s_dirty = false;
 static int64_t s_last_tx_us = 0;
 static usb_rumble_cb_t s_rumble_cb = NULL;
+static bool s_usb_installed = false;
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     (void)instance;
@@ -137,6 +138,7 @@ static uint8_t dpad_to_hat(uint32_t b) {
 }
 
 static void push_report(const stadia_hid_report_t *rep) {
+    if (!s_usb_installed) return;
     s_latest = *rep;
     if (tud_mounted() && tud_hid_ready()) {
         s_dirty = false;
@@ -193,6 +195,7 @@ void usb_gamepad_reset(void) {
 
 /* Re-send current state every 100 ms so newly-opened hidraw readers (Steam/SDL3) see neutral state */
 void usb_gamepad_keepalive_tick(void) {
+    if (!s_usb_installed) return;
     if (!tud_mounted() || !tud_hid_ready()) return;
     int64_t now = esp_timer_get_time();
     if ((now - s_last_tx_us) >= 100000) {
@@ -216,5 +219,6 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
         ESP_LOGE(TAG, "tinyusb_driver_install failed: %d", (int)err);
         return;
     }
+    s_usb_installed = true;
     ESP_LOGI(TAG, "USB HID Stadia Controller (18d1:9400) ready at 1000 Hz");
 }
