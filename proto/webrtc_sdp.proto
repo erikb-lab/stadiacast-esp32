@@ -1,0 +1,237 @@
+// protobuf schema used by the ota.282115 Gotham firmware
+syntax = "proto2";
+
+package chrome.cloudcast.proto.api.common;
+
+message RtcExtension {
+  optional uint32 id = 1;
+  optional string uri = 2;
+}
+
+message RtcSdpVideoColorSpaceInfo {
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpaceInfo.PrimaryID primary_id = 1;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpaceInfo.TransferID transfer_id = 2;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpaceInfo.MatrixID matrix_id = 3;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpaceInfo.RangeID range_id = 4;
+
+  enum PrimaryID {
+    PRIMARY_ID_UNDEFINED = 0;
+    PRIMARY_ID_BT709 = 1;
+    PRIMARY_ID_UNSPECIFIED = 2;
+    PRIMARY_ID_BT470M = 4;
+    PRIMARY_ID_BT470BG = 5;
+    PRIMARY_ID_SMPTE170M = 6;
+    PRIMARY_ID_SMPTE240M = 7;
+    PRIMARY_ID_FILM = 8;
+    PRIMARY_ID_BT2020 = 9;
+    PRIMARY_ID_SMPTEST428 = 10;
+    PRIMARY_ID_SMPTE431 = 11;
+    PRIMARY_ID_SMPTE432 = 12;
+    PRIMARY_ID_JEDEC_P22 = 22;
+  }
+
+  enum TransferID {
+    TRANSFER_ID_UNDEFINED = 0;
+    TRANSFER_ID_BT709 = 1;
+    TRANSFER_ID_UNSPECIFIED = 2;
+    TRANSFER_ID_GAMMA22 = 4;
+    TRANSFER_ID_GAMMA28 = 5;
+    TRANSFER_ID_SMPTE170M = 6;
+    TRANSFER_ID_SMPTE240M = 7;
+    TRANSFER_ID_LINEAR = 8;
+    TRANSFER_ID_LOG = 9;
+    TRANSFER_ID_LOG_SQRT = 10;
+    TRANSFER_ID_IEC61966_2_4 = 11;
+    TRANSFER_ID_BT1361_ECG = 12;
+    TRANSFER_ID_IEC61966_2_1 = 13;
+    TRANSFER_ID_BT2020_10 = 14;
+    TRANSFER_ID_BT2020_12 = 15;
+    TRANSFER_ID_SMPTEST2084 = 16;
+    TRANSFER_ID_SMPTEST428 = 17;
+    TRANSFER_ID_ARIB_STD_B67 = 18;
+  }
+
+  enum MatrixID {
+    MATRIX_ID_RGB = 0;
+    MATRIX_ID_BT709 = 1;
+    MATRIX_ID_UNSPECIFIED = 2;
+    MATRIX_ID_FCC = 4;
+    MATRIX_ID_BT470BG = 5;
+    MATRIX_ID_SMPTE170M = 6;
+    MATRIX_ID_SMPTE240M = 7;
+    MATRIX_ID_YCOCG = 8;
+    MATRIX_ID_BT2020_NCL = 9;
+    MATRIX_ID_BT2020_CL = 10;
+    MATRIX_ID_SMPTE2085 = 11;
+    MATRIX_ID_CHROMA_DERIVED_NCL = 12;
+    MATRIX_ID_CHROMA_DERIVED_CL = 13;
+    MATRIX_ID_ICTCP = 14;
+  }
+
+  enum RangeID {
+    RANGE_ID_UNSPECIFIED = 0;
+    RANGE_ID_LIMITED = 1;
+    RANGE_ID_FULL = 2;
+    RANGE_ID_DERIVED = 3;
+  }
+}
+
+message RtcSdpVideoResolution {
+  optional uint32 width = 1;
+  optional uint32 height = 2;
+}
+
+message RtcSdpVideoVp9SpecificFormat {
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoVp9Profile profile = 1;
+}
+
+message RtcSdpVideoHdrMetadata {
+  optional float primary_red_x = 1;
+  optional float primary_red_y = 2;
+  optional float primary_green_x = 3;
+  optional float primary_green_y = 4;
+  optional float primary_blue_x = 5;
+  optional float primary_blue_y = 6;
+  optional float white_point_x = 7;
+  optional float white_point_y = 8;
+  optional float min_luminance = 9;
+  optional float max_luminance = 10;
+  optional int32 max_content_light_level = 11;
+  optional int32 max_frame_average_light_level = 12;
+}
+
+message RtcSdpVideoFormat {
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoCodec codec = 1;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpace color_space = 2;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoResolution resolution = 3;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoColorSpaceInfo color_space_info = 5;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoHdrMetadata hdr_metadata = 6;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoVp9SpecificFormat vp9_format = 4;
+}
+
+message RtcSdpAudioFormat {
+  optional chrome.cloudcast.proto.api.common.RtcSdpAudioCodec codec = 1;
+  optional uint32 channels = 2;
+  optional uint32 sample_rate = 3;
+}
+
+message RtcSdpOffer {
+  optional string rtc_session_id = 1;
+  optional string rtc_session_version = 2;
+  optional string ice_ufrag = 3;
+  optional string ice_password = 4;
+  optional string fingerprint = 5;
+  repeated chrome.cloudcast.proto.api.common.RtcExtension video_extensions = 6;
+  repeated chrome.cloudcast.proto.api.common.RtcExtension audio_extensions = 7;
+  optional uint32 audio_ssrc = 8;
+  optional uint32 video_ssrc = 9;
+  optional string cname = 10;
+  optional uint32 flexfec_ssrc = 11;
+  optional uint32 rtx_ssrc = 12;
+  optional uint32 stream_connect_metadata_ssrc = 14;
+  optional bool boreal_available = 13;
+  repeated chrome.cloudcast.proto.api.common.BorealTransportProtocol boreal_supported_transports = 15;
+  repeated chrome.cloudcast.proto.api.common.RtcSdpVideoFormat video_format = 16;
+  repeated chrome.cloudcast.proto.api.common.RtcSdpAudioFormat audio_format = 17;
+  optional uint32 audio_ssrc_surround51_channel01 = 18;
+  optional uint32 audio_ssrc_surround51_channel23 = 19;
+  optional uint32 audio_ssrc_surround51_channel45 = 20;
+  optional bool raw_dtls = 21;
+  optional bool delayed_acks = 23;
+  optional chrome.cloudcast.proto.api.common.RtcSdpNetworkType network_type = 24;
+  optional bool use_rtp_timestamps = 25;
+}
+
+message RtcSdpAnswer {
+  optional string ice_ufrag = 1;
+  optional string ice_password = 2;
+  optional string fingerprint = 3;
+  optional string secondary_fingerprint = 4;
+  optional chrome.cloudcast.proto.api.common.RtcSdpAnswer.ClientType client_type = 5;
+  optional bool use_boreal = 6;
+  optional chrome.cloudcast.proto.api.common.BorealTransportProtocol boreal_transport = 7;
+  optional chrome.cloudcast.proto.api.common.RtcSdpVideoFormat video_format = 8;
+  optional chrome.cloudcast.proto.api.common.RtcSdpAudioFormat audio_format = 9;
+  optional bool raw_dtls = 10;
+  optional bool delayed_acks = 11;
+  optional bool disable_game_stats = 12;
+  optional bool disable_frame_tokens = 13;
+  optional string build_number = 14;
+  optional chrome.cloudcast.proto.api.common.RtcSdpNetworkType network_type = 15;
+  optional string ui_version = 16;
+  optional bool use_rtp_timestamps = 17;
+
+  enum ClientType {
+    UNKNOWN = 0;
+    DAYDREAM = 1;
+  }
+}
+
+message RtcIceCandidate {
+  optional string sdp_mid = 1;
+  optional int32 sdp_mline_index = 2;
+  optional string foundation = 3;
+  optional uint32 priority = 4;
+  optional string local_endpoint_ip = 5;
+  optional uint32 local_endpoint_port = 6;
+}
+
+message WebRtcSdp {
+  optional chrome.cloudcast.proto.api.common.WebRtcSdp.Type type = 1;
+  optional string raw_value = 2;
+  optional chrome.cloudcast.proto.api.common.RtcSdpOffer sdp_offer = 3;
+  optional chrome.cloudcast.proto.api.common.RtcSdpAnswer sdp_answer = 4;
+  optional chrome.cloudcast.proto.api.common.RtcIceCandidate ice_candidate = 5;
+
+  enum Type {
+    UNKNOWN = 0;
+    SDP_OFFER = 1;
+    SDP_ANSWER = 2;
+    ICE_CANDIDATE = 3;
+  }
+}
+
+message WebRtcSdpAndIceCandidates {
+  optional chrome.cloudcast.proto.api.common.WebRtcSdp sdp = 1;
+  repeated chrome.cloudcast.proto.api.common.WebRtcSdp ice_candidate = 2;
+}
+
+enum BorealTransportProtocol {
+  BOREAL_UNKNOWN_TRANSPORT = 0;
+  BOREAL_SCTP = 1;
+  BOREAL_SRTP = 2;
+  BOREAL_QUIC = 3;
+  BOREAL_QUARTC = 4;
+}
+
+enum RtcSdpVideoCodec {
+  VIDEO_CODEC_UNKNOWN = 0;
+  VIDEO_CODEC_H264 = 1;
+  VIDEO_CODEC_VP8 = 5;
+  VIDEO_CODEC_VP9 = 3;
+  VIDEO_CODEC_GENERIC = 4;
+}
+
+enum RtcSdpVideoColorSpace {
+  VIDEO_COLOR_SPACE_UNKNOWN = 0;
+  VIDEO_COLOR_SPACE_SRGB = 1;
+  VIDEO_COLOR_SPACE_HDR10 = 2;
+}
+
+enum RtcSdpVideoVp9Profile {
+  VIDEO_VP9_PROFILE_0 = 0;
+  VIDEO_VP9_PROFILE_2 = 2;
+}
+
+enum RtcSdpAudioCodec {
+  AUDIO_CODEC_UNKNOWN = 0;
+  AUDIO_CODEC_OPUS = 1;
+}
+
+enum RtcSdpNetworkType {
+  NETWORK_TYPE_UNKNOWN = 0;
+  NETWORK_TYPE_ETHERNET = 1;
+  NETWORK_TYPE_WIFI = 2;
+  NETWORK_TYPE_CELLULAR_LTE = 3;
+  NETWORK_TYPE_CELLULAR_5G = 4;
+}

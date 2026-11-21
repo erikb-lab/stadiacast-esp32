@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+build-*/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+
+# Private TLS keys — main/certs/fullchain.pem (the public chain) is kept;
+# privkey.pem is not.  To build from a fresh clone:
+#   cp /home/erik/esp/stadiacast/certs/privkey.pem main/certs/
+**/*privkey*.pem
+**/*.key
+**/*.key.pem
+
+# Host scratch and noise
+.tmp/
+*.log
+.DS_Store
+
+# Host test binary (built by tools/test_protos.sh)
+tests/test_protos

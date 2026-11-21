@@ -1,0 +1,9 @@
+# Defaults for gotham.discovery.proto (matches firmware struct sizes: RegisterControllerRequest ~0x1e8)
+* max_size:128
+* max_count:8
+# RegisterControllerRequest resume path: discovery carries a serialized WebRtcSdpAndIceCandidates offer bundle
+gotham.discovery.DiscoverDisplayRequest.sdp_offer_bundle max_size:1024
+# ControllerCommand (the /gmsg extension, tag 269197544) carries the serialized WebRtcSdpAndIceCandidates
+gotham.discovery.ControllerCommand.payload max_size:1024
+# Firmware writes up to 64 typed keys on the RegisterController resume path (struct comment: "max_count 64")
+gotham.discovery.TypedKeys.key max_count:64

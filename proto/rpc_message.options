@@ -1,0 +1,7 @@
+# Default
+* max_size:128
+* max_count:8
+# Large payload fields (namemasks match the full package-qualified dotname)
+gotham.rpc.RpcRequest.payload max_size:1024
+gotham.rpc.RpcNotification.payload max_size:1024
+gotham.rpc.RpcResponse.payload max_size:1024

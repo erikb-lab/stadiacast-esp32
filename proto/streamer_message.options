@@ -1,0 +1,4 @@
+# Default
+* max_size:128
+* max_count:8
+StreamerRequest.f3 max_size:31

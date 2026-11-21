@@ -1,0 +1,9 @@
+# Default
+* max_size:128
+* max_count:8
+# Large SDP raw value
+chrome.cloudcast.proto.api.common.WebRtcSdp.raw_value max_size:1024
+# RtcSdpAnswer.fingerprint holds "sha-256 " + 95 colon-separated hex chars
+chrome.cloudcast.proto.api.common.RtcSdpAnswer.fingerprint max_size:128
+# Firmware answers with 4 ICE candidates (sdp + candidates)
+chrome.cloudcast.proto.api.common.WebRtcSdpAndIceCandidates.ice_candidate max_count:4
