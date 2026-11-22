@@ -8,14 +8,31 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "tinyusb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/portmacro.h"
 #include "class/hid/hid_device.h"
+#include "device/usbd_pvt.h"
+#include "usb_audio.h"
 
 #define TAG "USB-STADIA"
 
 #define INPUT_REPORT_ID     3
 #define RUMBLE_REPORT_ID    5
 #define TRIGGER_THRESHOLD   30
-#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN)
+#define UAC1_IAD_DESC_LEN 8
+#define UAC1_SPK_AUDIO_DESC_LEN ( \
+    UAC1_IAD_DESC_LEN + \
+    TUD_AUDIO10_DESC_STD_AC_LEN + \
+    TUD_AUDIO10_DESC_CS_AC_LEN(1) + \
+    TUD_AUDIO10_DESC_INPUT_TERM_LEN + \
+    TUD_AUDIO10_DESC_OUTPUT_TERM_LEN + \
+    TUD_AUDIO10_DESC_STD_AS_LEN + \
+    TUD_AUDIO10_DESC_STD_AS_LEN + \
+    TUD_AUDIO10_DESC_CS_AS_INT_LEN + \
+    TUD_AUDIO10_DESC_TYPE_I_FORMAT_LEN(1) + \
+    TUD_AUDIO10_DESC_STD_AS_ISO_EP_LEN + \
+    TUD_AUDIO10_DESC_CS_AS_ISO_EP_LEN )
+#define TUSB_DESC_TOTAL_LEN (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + UAC1_SPK_AUDIO_DESC_LEN)
 
 typedef struct __attribute__((packed)) {
     uint8_t hat;
@@ -37,9 +54,9 @@ static const tusb_desc_device_t s_device_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
     .bcdUSB             = 0x0200,
-    .bDeviceClass       = 0x00,
-    .bDeviceSubClass    = 0x00,
-    .bDeviceProtocol    = 0x00,
+    .bDeviceClass       = TUSB_CLASS_MISC,
+    .bDeviceSubClass    = MISC_SUBCLASS_COMMON,
+    .bDeviceProtocol    = MISC_PROTOCOL_IAD,
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = 0x18D1,
     .idProduct          = 0x9400,
@@ -58,16 +75,58 @@ static const char *s_string_desc[] = {
 };
 
 static const uint8_t s_config_desc[] = {
-    TUD_CONFIG_DESCRIPTOR(1, 1, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
-    /* IN EP 0x81 + OUT EP 0x01, 64B, 1 ms (1000 Hz) */
-    TUD_HID_INOUT_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof(s_hid_report_desc), 0x01, 0x81, 64, 1),
+    TUD_CONFIG_DESCRIPTOR(1, USB_ITF_TOTAL, 0, TUSB_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
+    /* ITF 0: Stadia HID Gamepad + Rumble (EP 0x01 OUT, EP 0x81 IN, 64B, 1 ms) */
+    TUD_HID_INOUT_DESCRIPTOR(USB_ITF_HID, 0, HID_ITF_PROTOCOL_NONE, sizeof(s_hid_report_desc), 0x01, 0x81, 64, 1),
+    /* ITF 1..2: IAD + UAC1 Stereo Speaker OUT (EP 0x02, 192B, 48 kHz 16-bit, NO_SYNC) */
+    0x08, TUSB_DESC_INTERFACE_ASSOCIATION, USB_ITF_AUDIO_CONTROL, 0x02, TUSB_CLASS_AUDIO, 0x00, 0x00, 0x00,
+    TUD_AUDIO10_DESC_STD_AC(USB_ITF_AUDIO_CONTROL, 0x00, 0x00),
+    TUD_AUDIO10_DESC_CS_AC(
+        0x0100,
+        (TUD_AUDIO10_DESC_INPUT_TERM_LEN + TUD_AUDIO10_DESC_OUTPUT_TERM_LEN),
+        USB_ITF_AUDIO_STREAMING_SPK),
+    TUD_AUDIO10_DESC_INPUT_TERM(USB_UAC1_SPK_IT_ID, AUDIO_TERM_TYPE_USB_STREAMING, 0x00, 0x02, 0x0003, 0x00, 0x00),
+    TUD_AUDIO10_DESC_OUTPUT_TERM(USB_UAC1_SPK_OT_ID, AUDIO_TERM_TYPE_OUT_HEADPHONES, 0x00, USB_UAC1_SPK_IT_ID, 0x00),
+    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_SPK, 0x00, 0x00, 0x00),
+    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_SPK, 0x01, 0x01, 0x00),
+    TUD_AUDIO10_DESC_CS_AS_INT(USB_UAC1_SPK_IT_ID, 0x01, AUDIO10_DATA_FORMAT_TYPE_I_PCM),
+    TUD_AUDIO10_DESC_TYPE_I_FORMAT(0x02, 2, 16, 48000),
+    TUD_AUDIO10_DESC_STD_AS_ISO_EP(USB_UAC1_SPK_EP_OUT, (uint8_t)(TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_NO_SYNC), USB_UAC1_SPK_MPS, 0x01, 0x00),
+    TUD_AUDIO10_DESC_CS_AS_ISO_EP(0x00, AUDIO10_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, 0x0001),
 };
 
+_Static_assert(sizeof(s_config_desc) == TUSB_DESC_TOTAL_LEN, "s_config_desc size mismatch");
+
+static portMUX_TYPE s_hid_mux = portMUX_INITIALIZER_UNLOCKED;
 static stadia_hid_report_t s_latest = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
-static volatile bool s_dirty = false;
+static bool s_dirty = false;
+static bool s_kick_pending = false;
 static int64_t s_last_tx_us = 0;
 static usb_rumble_cb_t s_rumble_cb = NULL;
 static bool s_usb_installed = false;
+
+static void hid_flush_on_tusb_task(void *arg) {
+    (void)arg;
+    stadia_hid_report_t rep;
+    bool should_send = false;
+    portENTER_CRITICAL(&s_hid_mux);
+    s_kick_pending = false;
+    if (s_dirty) {
+        rep = s_latest;
+        s_dirty = false;
+        should_send = true;
+    }
+    portEXIT_CRITICAL(&s_hid_mux);
+
+    if (should_send && tud_mounted() && tud_hid_ready()) {
+        s_last_tx_us = esp_timer_get_time();
+        tud_hid_report(INPUT_REPORT_ID, &rep, sizeof(rep));
+    } else if (should_send) {
+        portENTER_CRITICAL(&s_hid_mux);
+        s_dirty = true;
+        portEXIT_CRITICAL(&s_hid_mux);
+    }
+}
 
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     (void)instance;
@@ -79,7 +138,9 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                uint8_t *buffer, uint16_t reqlen) {
     (void)instance; (void)report_type;
     if (report_id == INPUT_REPORT_ID && reqlen >= sizeof(s_latest)) {
+        portENTER_CRITICAL(&s_hid_mux);
         memcpy(buffer, &s_latest, sizeof(s_latest));
+        portEXIT_CRITICAL(&s_hid_mux);
         return sizeof(s_latest);
     }
     return 0;
@@ -104,12 +165,7 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
 
 void tud_hid_report_complete_cb(uint8_t instance, uint8_t const *report, uint16_t len) {
     (void)instance; (void)report; (void)len;
-    if (s_dirty && tud_mounted() && tud_hid_ready()) {
-        stadia_hid_report_t rep = s_latest;
-        s_dirty = false;
-        s_last_tx_us = esp_timer_get_time();
-        tud_hid_report(INPUT_REPORT_ID, &rep, sizeof(rep));
-    }
+    hid_flush_on_tusb_task(NULL);
 }
 
 static uint8_t axis_to_u8(int32_t v) {
@@ -139,13 +195,17 @@ static uint8_t dpad_to_hat(uint32_t b) {
 
 static void push_report(const stadia_hid_report_t *rep) {
     if (!s_usb_installed) return;
+    bool kick = false;
+    portENTER_CRITICAL(&s_hid_mux);
     s_latest = *rep;
-    if (tud_mounted() && tud_hid_ready()) {
-        s_dirty = false;
-        s_last_tx_us = esp_timer_get_time();
-        tud_hid_report(INPUT_REPORT_ID, rep, sizeof(*rep));
-    } else {
-        s_dirty = true;
+    s_dirty = true;
+    if (!s_kick_pending) {
+        s_kick_pending = true;
+        kick = true;
+    }
+    portEXIT_CRITICAL(&s_hid_mux);
+    if (kick) {
+        usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
     }
 }
 
@@ -193,20 +253,28 @@ void usb_gamepad_reset(void) {
     push_report(&neutral);
 }
 
-/* Re-send current state every 100 ms so newly-opened hidraw readers (Steam/SDL3) see neutral state */
+/* Re-send current state every 100 ms safely via Core 1 TinyUSB task */
 void usb_gamepad_keepalive_tick(void) {
     if (!s_usb_installed) return;
-    if (!tud_mounted() || !tud_hid_ready()) return;
     int64_t now = esp_timer_get_time();
     if ((now - s_last_tx_us) >= 100000) {
-        stadia_hid_report_t rep = s_latest;
-        s_last_tx_us = now;
-        tud_hid_report(INPUT_REPORT_ID, &rep, sizeof(rep));
+        bool kick = false;
+        portENTER_CRITICAL(&s_hid_mux);
+        s_dirty = true;
+        if (!s_kick_pending) {
+            s_kick_pending = true;
+            kick = true;
+        }
+        portEXIT_CRITICAL(&s_hid_mux);
+        if (kick) {
+            usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
+        }
     }
 }
 
 void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
     s_rumble_cb = rumble_cb;
+    usb_audio_init();
     const tinyusb_config_t tusb_cfg = {
         .device_descriptor        = &s_device_desc,
         .string_descriptor        = s_string_desc,
