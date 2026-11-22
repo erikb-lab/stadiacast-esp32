@@ -327,8 +327,18 @@ static size_t gunzip_to_buf(const uint8_t *in, size_t in_len, uint8_t *out, size
     if (off + 8 >= in_len) return 0;
 
     size_t deflate_len = in_len - off - 8; /* Exclude 8-byte CRC32+ISIZE trailer */
-    size_t res = tinfl_decompress_mem_to_mem(out, out_cap, in + off, deflate_len, 0);
-    return (res == TINFL_DECOMPRESS_MEM_TO_MEM_FAILED) ? 0 : res;
+    /* Allocate 11 KB tinfl_decompressor in PSRAM so we never overflow the task stack */
+    tinfl_decompressor *decomp = heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!decomp) return 0;
+    tinfl_init(decomp);
+    size_t in_bytes = deflate_len;
+    size_t out_bytes = out_cap;
+    tinfl_status status = tinfl_decompress(decomp,
+                                           (const mz_uint8 *)(in + off), &in_bytes,
+                                           (mz_uint8 *)out, (mz_uint8 *)out, &out_bytes,
+                                           TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+    free(decomp);
+    return (status == TINFL_STATUS_DONE) ? out_bytes : 0;
 }
 
 static int rng_cb(void *ctx, unsigned char *buf, size_t len) {
@@ -354,11 +364,20 @@ static bool encrypt_pass_from_bundle(const char *json_str, const char *pass,
 
     const char *pk_b64 = pk_item->valuestring;
     size_t der_len = 0;
-    uint8_t der[1024];
-    int rc = mbedtls_base64_decode(der, sizeof(der), &der_len,
+    uint8_t *der = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *ct  = heap_caps_malloc(512,  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!der || !ct) {
+        free(der);
+        free(ct);
+        cJSON_Delete(root);
+        return false;
+    }
+    int rc = mbedtls_base64_decode(der, 1024, &der_len,
                                    (const unsigned char *)pk_b64, strlen(pk_b64));
     cJSON_Delete(root);
     if (rc != 0 || der_len == 0) {
+        free(der);
+        free(ct);
         ESP_LOGE(TAG, "public_key base64 decode failed: %d", rc);
         return false;
     }
@@ -366,24 +385,27 @@ static bool encrypt_pass_from_bundle(const char *json_str, const char *pass,
     mbedtls_pk_context pk;
     mbedtls_pk_init(&pk);
     rc = mbedtls_pk_parse_public_key(&pk, der, der_len);
+    free(der);
     if (rc != 0) {
+        free(ct);
         mbedtls_pk_free(&pk);
         ESP_LOGE(TAG, "pk_parse_public_key failed: -0x%04x", -rc);
         return false;
     }
 
-    uint8_t ct[512];
     size_t ct_len = 0;
     rc = mbedtls_pk_encrypt(&pk, (const unsigned char *)pass, strlen(pass),
-                            ct, &ct_len, sizeof(ct), rng_cb, NULL);
+                            ct, &ct_len, 512, rng_cb, NULL);
     mbedtls_pk_free(&pk);
     if (rc != 0 || ct_len == 0) {
+        free(ct);
         ESP_LOGE(TAG, "RSA PKCS#1 v1.5 encrypt failed: -0x%04x", -rc);
         return false;
     }
 
     size_t out_len = 0;
     rc = mbedtls_base64_encode((unsigned char *)enc_b64_out, enc_b64_cap, &out_len, ct, ct_len);
+    free(ct);
     if (rc != 0) return false;
     enc_b64_out[out_len] = '\0';
     return true;
