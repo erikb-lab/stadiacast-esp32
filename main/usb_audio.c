@@ -9,7 +9,8 @@
 #define TAG "USB_AUDIO"
 
 /* Power-of-2 lock-free SPSC byte buffer for USB Speaker OUT (48kHz stereo s16le = 192B/ms) */
-#define SPK_SPSC_CAP 8192u /* ~42 ms */
+#define SPK_SPSC_CAP          8192u /* ~42 ms */
+#define SPK_OPUS_FRAME_BYTES  (STADIA_FRAME_SAMPLES * STADIA_SPK_CHANNELS * sizeof(int16_t)) /* 3840 B */
 
 typedef struct {
     uint8_t *buf;
@@ -37,6 +38,7 @@ static atomic_uint_fast32_t s_rx_cb_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_rx_bytes_total = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_tx_cb_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_tx_underruns = ATOMIC_VAR_INIT(0);
+static uint16_t             s_spk_rx_since_notify = 0;
 
 static inline size_t spsc_push(spsc_byte_buf_t *rb, const uint8_t *src, size_t len) {
     size_t head = atomic_load_explicit(&rb->head, memory_order_relaxed);
@@ -49,10 +51,15 @@ static inline size_t spsc_push(spsc_byte_buf_t *rb, const uint8_t *src, size_t l
     /* Always keep writes aligned to 4-byte stereo s16le frames */
     to_write &= ~((size_t)3u);
 
-    for (size_t i = 0; i < to_write; i++) {
-        rb->buf[(head + i) & mask] = src[i];
+    if (to_write > 0) {
+        size_t first = rb->capacity - head;
+        if (first > to_write) first = to_write;
+        memcpy(rb->buf + head, src, first);
+        if (to_write > first) {
+            memcpy(rb->buf, src + first, to_write - first);
+        }
+        atomic_store_explicit(&rb->head, (head + to_write) & mask, memory_order_release);
     }
-    atomic_store_explicit(&rb->head, (head + to_write) & mask, memory_order_release);
 
     if (to_write < len) {
         atomic_fetch_add_explicit(&rb->drops, (uint_fast32_t)(len - to_write), memory_order_relaxed);
@@ -69,10 +76,15 @@ static inline size_t spsc_pop(spsc_byte_buf_t *rb, uint8_t *dst, size_t len) {
 
     to_read &= ~((size_t)3u);
 
-    for (size_t i = 0; i < to_read; i++) {
-        dst[i] = rb->buf[(tail + i) & mask];
+    if (to_read > 0) {
+        size_t first = rb->capacity - tail;
+        if (first > to_read) first = to_read;
+        memcpy(dst, rb->buf + tail, first);
+        if (to_read > first) {
+            memcpy(dst + first, rb->buf, to_read - first);
+        }
+        atomic_store_explicit(&rb->tail, (tail + to_read) & mask, memory_order_release);
     }
-    atomic_store_explicit(&rb->tail, (tail + to_read) & mask, memory_order_release);
     return to_read;
 }
 
@@ -83,7 +95,7 @@ static inline void spsc_consumer_flush(spsc_byte_buf_t *rb) {
 }
 
 /* Push exactly 1 ms (48 mono s16le samples = 96 bytes) into TinyUSB EP IN FIFO.
- * ISR-safe: no float, no logging, no blocking, lock-free SPSC read only. */
+ * ISR-safe: no float, no logging, no blocking, lock-free 2-chunk memcpy SPSC read only. */
 static void push_mic_tx_1ms(void) {
     enum { SAMPLES_1MS = 48 };
     int16_t pcm[SAMPLES_1MS];
@@ -92,16 +104,16 @@ static void push_mic_tx_1ms(void) {
     bool primed = atomic_load_explicit(&s_mic_primed, memory_order_relaxed);
 
     if (!primed) {
-        /* Wait for 1 full Opus packet (20 ms = 960 samples) as jitter cushion */
-        if (avail >= STADIA_FRAME_SAMPLES) {
+        /* 10 ms (480 samples) cushion: half-frame low latency with zero startup stutter */
+        if (avail >= (STADIA_FRAME_SAMPLES / 2u)) {
             primed = true;
             atomic_store_explicit(&s_mic_primed, true, memory_order_relaxed);
         }
     }
 
     if (primed && avail >= SAMPLES_1MS) {
-        /* Gentle clock-drift slip: if >60 ms queued, drop 1 extra sample */
-        if (avail > (STADIA_FRAME_SAMPLES * 3u)) {
+        /* Gentle clock-drift slip: if >40 ms queued, drop 1 extra sample */
+        if (avail > (STADIA_FRAME_SAMPLES * 2u)) {
             int16_t discard;
             (void)stadia_opus_read_mic_pcm(&discard, 1u);
         }
@@ -125,6 +137,7 @@ void usb_audio_init(void) {
     atomic_store(&s_mic_alt, 0);
     atomic_store(&s_spk_flush, false);
     atomic_store(&s_mic_primed, false);
+    s_spk_rx_since_notify = 0;
     spsc_consumer_flush(&s_spk_buf);
     ESP_LOGI(TAG, "UAC1 full-duplex ready: SPK EP 0x%02X (%uB 48kHz stereo) + MIC EP 0x%02X (%uB 48kHz mono)",
              USB_UAC1_SPK_EP_OUT, (unsigned)USB_UAC1_SPK_MPS,
@@ -168,9 +181,11 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     uint8_t alt = tu_u16_low(p_request->wValue);
 
     if (itf == USB_ITF_AUDIO_STREAMING_SPK) {
+        s_spk_rx_since_notify = 0;
         atomic_store_explicit(&s_spk_alt, alt, memory_order_release);
         if (alt == 0) {
             atomic_store_explicit(&s_spk_flush, true, memory_order_release);
+            stadia_opus_notify();
         }
         return true;
     }
@@ -180,7 +195,6 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         stadia_opus_mic_reset();
         atomic_store_explicit(&s_mic_alt, alt, memory_order_release);
         if (alt != 0) {
-            /* Prime 1 ms frame into TinyUSB EP IN FIFO right after TinyUSB schedules initial ZLP */
             push_mic_tx_1ms();
         }
         return true;
@@ -194,8 +208,10 @@ bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const 
     if (!p_request) return false;
     uint8_t itf = tu_u16_low(p_request->wIndex);
     if (itf == USB_ITF_AUDIO_STREAMING_SPK) {
+        s_spk_rx_since_notify = 0;
         atomic_store_explicit(&s_spk_alt, 0, memory_order_release);
         atomic_store_explicit(&s_spk_flush, true, memory_order_release);
+        stadia_opus_notify();
     } else if (itf == USB_ITF_AUDIO_STREAMING_MIC) {
         atomic_store_explicit(&s_mic_alt, 0, memory_order_release);
         atomic_store_explicit(&s_mic_primed, false, memory_order_release);
@@ -226,9 +242,16 @@ bool tud_audio_rx_done_isr(uint8_t rhport, uint16_t n_bytes_received, uint8_t fu
     uint16_t to_read = (n_bytes_received > sizeof(tmp)) ? (uint16_t)sizeof(tmp) : n_bytes_received;
     uint16_t r = tud_audio_read(tmp, to_read);
     if (r > 0) {
-        spsc_push(&s_spk_buf, tmp, r);
+        size_t pushed = spsc_push(&s_spk_buf, tmp, r);
         atomic_fetch_add_explicit(&s_rx_cb_count, 1u, memory_order_relaxed);
         atomic_fetch_add_explicit(&s_rx_bytes_total, r, memory_order_relaxed);
+
+        /* Wake Core 1 Opus encoder exactly once per 20 ms frame (3840 bytes) */
+        s_spk_rx_since_notify += (uint16_t)pushed;
+        if (s_spk_rx_since_notify >= SPK_OPUS_FRAME_BYTES) {
+            s_spk_rx_since_notify -= SPK_OPUS_FRAME_BYTES;
+            stadia_opus_notify_from_isr();
+        }
     }
     return true;
 }

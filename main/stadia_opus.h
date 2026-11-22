@@ -16,6 +16,10 @@ void stadia_opus_init(void);
 void stadia_opus_set_loopback(bool enable);
 bool stadia_opus_is_loopback(void);
 
+/* Wake Core 1 Opus worker immediately (task or ISR context) */
+void stadia_opus_notify(void);
+void stadia_opus_notify_from_isr(void);
+
 /* Core 0 (SRTP RX) -> Core 1 (Opus decoder) */
 bool stadia_opus_push_rx_packet(const uint8_t *opus_data, size_t len);
 

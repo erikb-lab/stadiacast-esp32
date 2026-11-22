@@ -3,7 +3,6 @@
 
 #include <string.h>
 #include "esp_log.h"
-#include "mbedtls/md.h"
 
 #define TAG "SRTP"
 
@@ -28,14 +27,30 @@ static void srtp_kdf_label(const uint8_t master_key[16],
     mbedtls_aes_free(&aes);
 }
 
-static void srtp_dir_setup(srtp_dir_t *d, const uint8_t mkey[16], const uint8_t msalt[14]) {
+static void srtp_dir_free(srtp_dir_t *d) {
     if (d->ready) mbedtls_aes_free(&d->aes);
+    if (d->hmac_ready) mbedtls_md_free(&d->hmac_ctx);
     memset(d, 0, sizeof(*d));
+}
+
+static void srtp_dir_setup(srtp_dir_t *d, const uint8_t mkey[16], const uint8_t msalt[14]) {
+    srtp_dir_free(d);
     srtp_kdf_label(mkey, msalt, 0x00, d->enc_key, 16);
     srtp_kdf_label(mkey, msalt, 0x01, d->auth_key, 20);
     srtp_kdf_label(mkey, msalt, 0x02, d->salt, 14);
     mbedtls_aes_init(&d->aes);
     mbedtls_aes_setkey_enc(&d->aes, d->enc_key, 128);
+
+    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
+    if (md) {
+        mbedtls_md_init(&d->hmac_ctx);
+        if (mbedtls_md_setup(&d->hmac_ctx, md, 1) == 0 &&
+            mbedtls_md_hmac_starts(&d->hmac_ctx, d->auth_key, 20) == 0) {
+            d->hmac_ready = true;
+        } else {
+            mbedtls_md_free(&d->hmac_ctx);
+        }
+    }
     d->ready = true;
 }
 
@@ -44,9 +59,9 @@ void stadia_srtp_init(stadia_srtp_ctx_t *ctx) {
 }
 
 void stadia_srtp_free(stadia_srtp_ctx_t *ctx) {
-    if (ctx->tx.ready) mbedtls_aes_free(&ctx->tx.aes);
-    if (ctx->rx.ready) mbedtls_aes_free(&ctx->rx.aes);
-    memset(ctx, 0, sizeof(*ctx));
+    srtp_dir_free(&ctx->tx);
+    srtp_dir_free(&ctx->rx);
+    ctx->keys_ready = false;
 }
 
 void stadia_srtp_export_cb(void *p_expkey,
@@ -77,7 +92,7 @@ void stadia_srtp_export_cb(void *p_expkey,
     srtp_dir_setup(&ctx->rx, kb + 0,  kb + 32);
     srtp_dir_setup(&ctx->tx, kb + 16, kb + 46);
     ctx->keys_ready = true;
-    ESP_LOGI(TAG, "DTLS-SRTP keys derived (AES128_CM_SHA1_80)");
+    ESP_LOGI(TAG, "DTLS-SRTP keys derived (AES128_CM_SHA1_80, persistent HMAC)");
 }
 
 static size_t rtp_header_len(const uint8_t *pkt, size_t len) {
@@ -110,26 +125,20 @@ static void srtp_build_iv(const uint8_t salt[14], uint32_t ssrc,
     iv[13] ^= (uint8_t)(seq);
 }
 
-static bool srtp_hmac_sha1_80(const uint8_t auth_key[20],
+/* Zero-alloc HMAC-SHA1-80 reusing pre-keyed persistent mbedtls_md_context_t */
+static bool srtp_hmac_sha1_80(srtp_dir_t *d,
                               const uint8_t *pkt, size_t pkt_len,
                               uint32_t roc, uint8_t tag_out[STADIA_SRTP_TAG_LEN]) {
-    const mbedtls_md_info_t *md = mbedtls_md_info_from_type(MBEDTLS_MD_SHA1);
-    if (!md) return false;
-    mbedtls_md_context_t mc;
-    mbedtls_md_init(&mc);
-    if (mbedtls_md_setup(&mc, md, 1) != 0) { mbedtls_md_free(&mc); return false; }
-
+    if (!d->hmac_ready) return false;
     uint8_t roc_be[4] = {
         (uint8_t)(roc >> 24), (uint8_t)(roc >> 16),
         (uint8_t)(roc >> 8),  (uint8_t)(roc)
     };
     uint8_t full_mac[20];
-    mbedtls_md_hmac_starts(&mc, auth_key, 20);
-    mbedtls_md_hmac_update(&mc, pkt, pkt_len);
-    mbedtls_md_hmac_update(&mc, roc_be, 4);
-    mbedtls_md_hmac_finish(&mc, full_mac);
-    mbedtls_md_free(&mc);
-
+    if (mbedtls_md_hmac_reset(&d->hmac_ctx) != 0) return false;
+    mbedtls_md_hmac_update(&d->hmac_ctx, pkt, pkt_len);
+    mbedtls_md_hmac_update(&d->hmac_ctx, roc_be, 4);
+    mbedtls_md_hmac_finish(&d->hmac_ctx, full_mac);
     memcpy(tag_out, full_mac, STADIA_SRTP_TAG_LEN);
     return true;
 }
@@ -174,7 +183,7 @@ bool stadia_srtp_protect(stadia_srtp_ctx_t *ctx, uint8_t *buf, size_t rtp_len, s
         mbedtls_aes_crypt_ctr(&ctx->tx.aes, plen, &nc_off, iv, sb, buf + hlen, buf + hlen);
     }
 
-    if (!srtp_hmac_sha1_80(ctx->tx.auth_key, buf, rtp_len, roc, buf + rtp_len)) return false;
+    if (!srtp_hmac_sha1_80(&ctx->tx, buf, rtp_len, roc, buf + rtp_len)) return false;
     update_roc(&ctx->tx, seq, roc);
     if (out_len) *out_len = rtp_len + STADIA_SRTP_TAG_LEN;
     return true;
@@ -193,7 +202,7 @@ bool stadia_srtp_unprotect(stadia_srtp_ctx_t *ctx, uint8_t *buf, size_t srtp_len
     uint32_t roc = estimate_roc(&ctx->rx, seq);
 
     uint8_t calc_tag[STADIA_SRTP_TAG_LEN];
-    if (!srtp_hmac_sha1_80(ctx->rx.auth_key, buf, rtp_len, roc, calc_tag)) return false;
+    if (!srtp_hmac_sha1_80(&ctx->rx, buf, rtp_len, roc, calc_tag)) return false;
 
     uint8_t diff = 0;
     for (int i = 0; i < STADIA_SRTP_TAG_LEN; i++) diff |= (uint8_t)(calc_tag[i] ^ buf[rtp_len + i]);

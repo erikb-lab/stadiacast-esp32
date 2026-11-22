@@ -53,7 +53,11 @@ void wifi_ap_init(void) {
         },
     };
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
-    ESP_LOGI(TAG, "SoftAP up: SSID=%s, IP=192.168.4.1, WPA2-PSK, no PMF, 6 max stations", SOFTAP_SSID);
+    /* 52 * 0.25 dBm = +13 dBm (20 mW vs default 100 mW): huge heat drop, plenty for room range */
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(52));
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+    ESP_LOGI(TAG, "SoftAP up: SSID=%s, IP=192.168.4.1, HT20, +13dBm, WPA2-PSK, no PMF", SOFTAP_SSID);
 }

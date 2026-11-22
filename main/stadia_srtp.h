@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "mbedtls/aes.h"
+#include "mbedtls/md.h"
 #include "mbedtls/ssl.h"
 
 #define STADIA_SRTP_TAG_LEN 10
@@ -19,6 +20,8 @@ typedef struct {
     uint16_t s_l;
     bool     has_seq;
     mbedtls_aes_context aes;
+    mbedtls_md_context_t hmac_ctx;
+    bool     hmac_ready;
 } srtp_dir_t;
 
 typedef struct {

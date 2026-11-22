@@ -1,4 +1,4 @@
-/* Core 1 full-duplex Opus encoder (48kHz stereo headset) & decoder (48kHz mono mic). */
+/* Core 1 event-driven full-duplex Opus encoder (48kHz stereo headset) & decoder (48kHz mono mic). */
 #include "stadia_opus.h"
 #include "usb_audio.h"
 
@@ -13,10 +13,12 @@
 
 #define TAG "STADIA-OPUS"
 
+extern void stadia_transport_wake(void);
+
 #define PKT_RING_SLOTS  8u
 #define PKT_RING_MASK   (PKT_RING_SLOTS - 1u)
 
-/* Power-of-2 PCM sample rings (fast mask ops, wrap-safe forever, ISR-safe for mic consumer) */
+/* Power-of-2 PCM sample rings (2-chunk memcpy, wrap-safe forever, ISR-safe for mic consumer) */
 #define SPK_RING_CAP    8192u  /* 4096 stereo frames (~85 ms @ 48kHz) */
 #define SPK_RING_MASK   (SPK_RING_CAP - 1u)
 #define MIC_RING_CAP    4096u  /* 4096 mono samples  (~85 ms @ 48kHz) */
@@ -46,6 +48,7 @@ static atomic_uint   s_mic_head = ATOMIC_VAR_INIT(0);
 static atomic_uint   s_mic_tail = ATOMIC_VAR_INIT(0);
 
 static atomic_bool   s_loopback = ATOMIC_VAR_INIT(false);
+static TaskHandle_t  s_opus_task = NULL;
 
 /* Scratch frame buffers for Core 1 worker */
 static int16_t s_dec_mono[STADIA_FRAME_SAMPLES];
@@ -60,6 +63,20 @@ bool stadia_opus_is_loopback(void) {
     return atomic_load(&s_loopback);
 }
 
+void stadia_opus_notify(void) {
+    TaskHandle_t t = s_opus_task;
+    if (t) xTaskNotifyGive(t);
+}
+
+void stadia_opus_notify_from_isr(void) {
+    TaskHandle_t t = s_opus_task;
+    if (t) {
+        BaseType_t hpw = pdFALSE;
+        vTaskNotifyGiveFromISR(t, &hpw);
+        if (hpw) portYIELD_FROM_ISR();
+    }
+}
+
 bool stadia_opus_push_rx_packet(const uint8_t *opus_data, size_t len) {
     if (!opus_data || len == 0 || len > STADIA_MAX_OPUS_PKT_BYTES) return false;
     unsigned h = atomic_load_explicit(&s_rx_head, memory_order_relaxed);
@@ -69,6 +86,7 @@ bool stadia_opus_push_rx_packet(const uint8_t *opus_data, size_t len) {
     slot->len = (uint16_t)len;
     memcpy(slot->data, opus_data, len);
     atomic_store_explicit(&s_rx_head, h + 1u, memory_order_release);
+    stadia_opus_notify();
     return true;
 }
 
@@ -90,6 +108,7 @@ static bool push_tx_packet(const uint8_t *data, size_t len) {
     slot->len = (uint16_t)len;
     memcpy(slot->data, data, len);
     atomic_store_explicit(&s_tx_head, h + 1u, memory_order_release);
+    stadia_transport_wake();
     return true;
 }
 
@@ -111,8 +130,14 @@ size_t stadia_opus_write_speaker_pcm(const int16_t *stereo_samples, size_t frame
     unsigned t = atomic_load_explicit(&s_spk_tail, memory_order_acquire);
     size_t avail = SPK_RING_CAP - (h - t);
     if (n > avail) n = avail & ~((size_t)1u);
-    for (size_t i = 0; i < n; i++) {
-        s_spk_pcm[(h + i) & SPK_RING_MASK] = stereo_samples[i];
+    if (n == 0) return 0;
+
+    size_t pos = h & SPK_RING_MASK;
+    size_t first = SPK_RING_CAP - pos;
+    if (first > n) first = n;
+    memcpy(&s_spk_pcm[pos], stereo_samples, first * sizeof(int16_t));
+    if (n > first) {
+        memcpy(&s_spk_pcm[0], stereo_samples + first, (n - first) * sizeof(int16_t));
     }
     atomic_store_explicit(&s_spk_head, h + (unsigned)n, memory_order_release);
     return n / STADIA_SPK_CHANNELS;
@@ -124,13 +149,17 @@ static bool read_speaker_frame(int16_t *dst_stereo) {
     unsigned h = atomic_load_explicit(&s_spk_head, memory_order_acquire);
     unsigned used = h - t;
     if (used < need) return false;
-    /* Cap speaker latency to <= 60 ms (3 frames) if host got ahead */
-    while (used > (need * 3u)) {
+    /* Cap speaker latency to <= 40 ms (2 frames) */
+    while (used > (need * 2u)) {
         t += (unsigned)need;
         used -= (unsigned)need;
     }
-    for (size_t i = 0; i < need; i++) {
-        dst_stereo[i] = s_spk_pcm[(t + i) & SPK_RING_MASK];
+    size_t pos = t & SPK_RING_MASK;
+    size_t first = SPK_RING_CAP - pos;
+    if (first > need) first = need;
+    memcpy(dst_stereo, &s_spk_pcm[pos], first * sizeof(int16_t));
+    if (need > first) {
+        memcpy(dst_stereo + first, &s_spk_pcm[0], (need - first) * sizeof(int16_t));
     }
     atomic_store_explicit(&s_spk_tail, t + (unsigned)need, memory_order_release);
     return true;
@@ -141,8 +170,14 @@ static void write_mic_frame(const int16_t *src_mono, size_t samples) {
     unsigned t = atomic_load_explicit(&s_mic_tail, memory_order_acquire);
     size_t avail = MIC_RING_CAP - (h - t);
     if (samples > avail) samples = avail;
-    for (size_t i = 0; i < samples; i++) {
-        s_mic_pcm[(h + i) & MIC_RING_MASK] = src_mono[i];
+    if (samples == 0) return;
+
+    size_t pos = h & MIC_RING_MASK;
+    size_t first = MIC_RING_CAP - pos;
+    if (first > samples) first = samples;
+    memcpy(&s_mic_pcm[pos], src_mono, first * sizeof(int16_t));
+    if (samples > first) {
+        memcpy(&s_mic_pcm[0], src_mono + first, (samples - first) * sizeof(int16_t));
     }
     atomic_store_explicit(&s_mic_head, h + (unsigned)samples, memory_order_release);
 }
@@ -163,8 +198,14 @@ size_t stadia_opus_read_mic_pcm(int16_t *mono_out, size_t max_samples) {
     unsigned h = atomic_load_explicit(&s_mic_head, memory_order_acquire);
     size_t avail = (size_t)(h - t);
     size_t n = (avail < max_samples) ? avail : max_samples;
-    for (size_t i = 0; i < n; i++) {
-        mono_out[i] = s_mic_pcm[(t + i) & MIC_RING_MASK];
+    if (n == 0) return 0;
+
+    size_t pos = t & MIC_RING_MASK;
+    size_t first = MIC_RING_CAP - pos;
+    if (first > n) first = n;
+    memcpy(mono_out, &s_mic_pcm[pos], first * sizeof(int16_t));
+    if (n > first) {
+        memcpy(mono_out + first, &s_mic_pcm[0], (n - first) * sizeof(int16_t));
     }
     atomic_store_explicit(&s_mic_tail, t + (unsigned)n, memory_order_release);
     return n;
@@ -199,24 +240,22 @@ static void opus_worker_task(void *arg) {
     }
 
     opus_encoder_ctl(enc, OPUS_SET_BITRATE(64000));
-    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(1));
+    /* Complexity 0 in RESTRICTED_LOWDELAY (CELT-only): ~35% less CPU/heat at same 48kHz stereo quality */
+    opus_encoder_ctl(enc, OPUS_SET_COMPLEXITY(0));
     opus_encoder_ctl(enc, OPUS_SET_SIGNAL(OPUS_SIGNAL_MUSIC));
 
-    ESP_LOGI(TAG, "Core 1 Opus full-duplex worker ready (48kHz mono dec + stereo enc)");
+    ESP_LOGI(TAG, "Core 1 event-driven Opus worker ready (48kHz mono dec + stereo CELT enc, c=0)");
 
     opus_slot_t rx_pkt;
-    uint32_t frames_done = 0;
-    int64_t total_us = 0;
     bool prev_spk_active = false;
 
     while (1) {
         bool did_work = false;
         bool loopback = atomic_load_explicit(&s_loopback, memory_order_relaxed);
 
-        /* 1. Decode incoming controller mic Opus packet -> 48kHz mono PCM */
-        if (pop_rx_packet(&rx_pkt)) {
+        /* 1. Drain all queued incoming controller mic Opus packets -> 48kHz mono PCM */
+        while (pop_rx_packet(&rx_pkt)) {
             if (loopback || usb_audio_mic_active()) {
-                int64_t t0 = esp_timer_get_time();
                 int ns = opus_decode(dec, rx_pkt.data, rx_pkt.len,
                                      s_dec_mono, STADIA_FRAME_SAMPLES, 0);
                 if (ns > 0) {
@@ -233,13 +272,6 @@ static void opus_worker_task(void *arg) {
                     } else {
                         write_mic_frame(s_dec_mono, (size_t)ns);
                     }
-                    total_us += (esp_timer_get_time() - t0);
-                    frames_done++;
-                    if ((frames_done % 250u) == 0u) {
-                        ESP_LOGI(TAG, "Core 1 Opus avg dec frame time: %lld us / 20000 us",
-                                 (long long)(total_us / 250));
-                        total_us = 0;
-                    }
                 }
             }
             did_work = true;
@@ -249,7 +281,6 @@ static void opus_worker_task(void *arg) {
         if (!loopback) {
             bool spk_active = usb_audio_spk_active();
             if (!spk_active && prev_spk_active) {
-                /* Host closed speaker stream: drop any partial frame */
                 unsigned h = atomic_load_explicit(&s_spk_head, memory_order_relaxed);
                 atomic_store_explicit(&s_spk_tail, h, memory_order_release);
             }
@@ -263,7 +294,7 @@ static void opus_worker_task(void *arg) {
                 }
             }
 
-            if (read_speaker_frame(s_enc_stereo)) {
+            while (read_speaker_frame(s_enc_stereo)) {
                 int elen = opus_encode(enc, s_enc_stereo, STADIA_FRAME_SAMPLES,
                                        s_enc_pkt, sizeof(s_enc_pkt));
                 if (elen > 0) {
@@ -274,11 +305,12 @@ static void opus_worker_task(void *arg) {
         }
 
         if (!did_work) {
-            vTaskDelay(pdMS_TO_TICKS(2));
+            /* Sleep at 0% CPU until woken immediately by mic RX or 20ms speaker frame ready */
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
         }
     }
 }
 
 void stadia_opus_init(void) {
-    xTaskCreatePinnedToCore(opus_worker_task, "opus_audio", 16384, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(opus_worker_task, "opus_audio", 16384, NULL, 3, &s_opus_task, 1);
 }

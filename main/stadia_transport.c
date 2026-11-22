@@ -189,10 +189,7 @@ void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
 
 static int g_wake_sock = -1;
 
-void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
-    g_rumble_left_req = left_strong;
-    g_rumble_right_req = right_weak;
-    g_rumble_dirty = true;
+void stadia_transport_wake(void) {
     if (g_wake_sock >= 0) {
         struct sockaddr_in lo = {0};
         lo.sin_family = AF_INET;
@@ -201,6 +198,13 @@ void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
         uint8_t b = 0xFF;
         sendto(g_wake_sock, &b, 1, 0, (const struct sockaddr *)&lo, sizeof(lo));
     }
+}
+
+void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
+    g_rumble_left_req = left_strong;
+    g_rumble_right_req = right_weak;
+    g_rumble_dirty = true;
+    stadia_transport_wake();
 }
 
 /* ---------- Minimal Protobuf Wire Helpers (bypasses 128B nanopb wrapper caps) ---------- */
@@ -1196,47 +1200,49 @@ static void pump_dtls(dtls_link_t *L) {
 }
 
 static void service_socket(dtls_link_t *L) {
-    struct sockaddr_in src;
-    socklen_t slen = sizeof(src);
-    int n = recvfrom(L->sock, g_udp_buf, sizeof(g_udp_buf), 0, (struct sockaddr *)&src, &slen);
-    if (n <= 0) return;
-    if (n == 1 && g_udp_buf[0] == 0xFF) return;
+    for (int burst = 0; burst < 8; burst++) {
+        struct sockaddr_in src;
+        socklen_t slen = sizeof(src);
+        int n = recvfrom(L->sock, g_udp_buf, sizeof(g_udp_buf), MSG_DONTWAIT, (struct sockaddr *)&src, &slen);
+        if (n <= 0) return;
+        if (n == 1 && g_udp_buf[0] == 0xFF) continue;
 
-    if (!L->peer_seen || L->peer.sin_addr.s_addr != src.sin_addr.s_addr ||
-        L->peer.sin_port != src.sin_port) {
-        L->peer = src;
-        L->peer_seen = true;
-    }
-
-    uint8_t b0 = g_udp_buf[0];
-    if (b0 <= 3 && n >= 20 && memcmp(g_udp_buf + 4, STUN_MAGIC_BYTES, 4) == 0) {
-        handle_stun(L, g_udp_buf, (size_t)n, &src);
-    } else if (b0 >= 20 && b0 <= 63) {
-        L->dtls_seen = true;
-        if (L->handshake_done && b0 == 22 && n >= 14 &&
-            g_udp_buf[3] == 0 && g_udp_buf[4] == 0 && g_udp_buf[13] == 1) {
-            link_reset(L);
-            L->dtls_seen = true;
+        if (!L->peer_seen || L->peer.sin_addr.s_addr != src.sin_addr.s_addr ||
+            L->peer.sin_port != src.sin_port) {
+            L->peer = src;
+            L->peer_seen = true;
         }
-        memcpy(L->rx_buf, g_udp_buf, (size_t)n);
-        L->rx_len = (size_t)n;
-        pump_dtls(L);
-    } else if (b0 >= 128 && b0 <= 191 && L == &g_disp && L->srtp.keys_ready) {
-        uint8_t pt = g_udp_buf[1] & 0x7Fu;
-        if (pt < 64 || pt > 95) { /* RTP (skip RTCP 72..76) */
-            size_t rtp_len = 0;
-            if (stadia_srtp_unprotect(&L->srtp, g_udp_buf, (size_t)n, &rtp_len) &&
-                rtp_len > 12 && pt == 111) {
-                size_t hlen = 12u + 4u * (g_udp_buf[0] & 0x0Fu);
-                if ((g_udp_buf[0] & 0x10u) && hlen + 4u <= rtp_len) {
-                    uint16_t ext_w = (uint16_t)((g_udp_buf[hlen + 2] << 8) | g_udp_buf[hlen + 3]);
-                    hlen += 4u + 4u * ext_w;
-                }
-                if (rtp_len > hlen) {
-                    size_t plen = rtp_len - hlen;
-                    g_mic_rx_pkts++;
-                    g_mic_rx_bytes += (uint32_t)plen;
-                    stadia_opus_push_rx_packet(g_udp_buf + hlen, plen);
+
+        uint8_t b0 = g_udp_buf[0];
+        if (b0 <= 3 && n >= 20 && memcmp(g_udp_buf + 4, STUN_MAGIC_BYTES, 4) == 0) {
+            handle_stun(L, g_udp_buf, (size_t)n, &src);
+        } else if (b0 >= 20 && b0 <= 63) {
+            L->dtls_seen = true;
+            if (L->handshake_done && b0 == 22 && n >= 14 &&
+                g_udp_buf[3] == 0 && g_udp_buf[4] == 0 && g_udp_buf[13] == 1) {
+                link_reset(L);
+                L->dtls_seen = true;
+            }
+            memcpy(L->rx_buf, g_udp_buf, (size_t)n);
+            L->rx_len = (size_t)n;
+            pump_dtls(L);
+        } else if (b0 >= 128 && b0 <= 191 && L == &g_disp && L->srtp.keys_ready) {
+            uint8_t pt = g_udp_buf[1] & 0x7Fu;
+            if (pt < 64 || pt > 95) { /* RTP (skip RTCP 72..76) */
+                size_t rtp_len = 0;
+                if (stadia_srtp_unprotect(&L->srtp, g_udp_buf, (size_t)n, &rtp_len) &&
+                    rtp_len > 12 && pt == 111) {
+                    size_t hlen = 12u + 4u * (g_udp_buf[0] & 0x0Fu);
+                    if ((g_udp_buf[0] & 0x10u) && hlen + 4u <= rtp_len) {
+                        uint16_t ext_w = (uint16_t)((g_udp_buf[hlen + 2] << 8) | g_udp_buf[hlen + 3]);
+                        hlen += 4u + 4u * ext_w;
+                    }
+                    if (rtp_len > hlen) {
+                        size_t plen = rtp_len - hlen;
+                        g_mic_rx_pkts++;
+                        g_mic_rx_bytes += (uint32_t)plen;
+                        stadia_opus_push_rx_packet(g_udp_buf + hlen, plen);
+                    }
                 }
             }
         }
@@ -1291,7 +1297,8 @@ static void stadia_transport_task(void *arg) {
         FD_ZERO(&rfds);
         FD_SET(g_disp.sock, &rfds);
         FD_SET(g_game.sock, &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = (g_audio_enabled && g_disp.srtp.keys_ready) ? 4000 : 50000 };
+        /* Event-driven: wakes instantly via UDP RX or g_wake_sock (rumble / Opus TX); 50ms idle tick */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
         int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r > 0) {
             if (FD_ISSET(g_disp.sock, &rfds)) service_socket(&g_disp);
