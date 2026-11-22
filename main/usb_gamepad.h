@@ -17,6 +17,7 @@ usb_gamepad_mode_t usb_gamepad_get_mode(void);
 bool               usb_gamepad_save_mode(usb_gamepad_mode_t mode);
 void               usb_gamepad_set_deadzone(uint16_t dz);
 uint16_t           usb_gamepad_get_deadzone(void);
+void               usb_gamepad_set_battery(int pct);
 void               usb_gamepad_disconnect(void);
 
 void usb_gamepad_send(uint32_t stadia_buttons,

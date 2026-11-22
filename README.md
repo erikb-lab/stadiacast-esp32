@@ -13,6 +13,9 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
   - **Headset Output (Speaker):** 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
   - **Headset Input (Mic):** controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
   - **Hardware Mic Mute** & **Configurable Mic Gain** (`1.0x / 1.5x / 2.0x / 2.5x`, saved in NVS)
+- **Live Controller Battery Reporting**:
+  - **Native OS Battery Gauge (Stadia HID mode):** Standard USB HID Battery Strength (Report ID 4, `0–100%`) — shows up automatically in Linux UPower / KDE Plasma / GNOME (`gaming-input`) with zero extra drivers or daemons. Reads initial charge immediately on connect (`GetControllerStateResponse.f10`), tracks live 1% steps (`notification10`), and caches the last known level in NVS across reboots.
+  - **Low-Battery Alerts & On-Demand Check (Both Modes):** Haptic alerts at `≤ 15%` (3 buzzes) and `≤ 5%` (5 buzzes) with hysteresis, status LED double-dip warning, plus an instant quartile buzz hotkey.
 - **Radial Stick Deadzone (`0% / 4% / 8%`, saved in NVS)** & **On-Board Status LED (`GPIO 21`)**
 
 ## Controller Hotkeys
@@ -24,13 +27,15 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
 | **Toggle Mic Mute** | Tap **Assistant** *(XInput)* or **Assistant + Capture** *(both modes)* | 1 short buzz = muted, 2 quick taps = unmuted |
 | **Mic Gain Up / Down** | Hold **Assistant + Capture** + tap **D-Pad Up / Down** | 1–4 quick taps (`1.0x / 1.5x / 2.0x / 2.5x`) |
 | **Cycle Stick Deadzone** | Hold **Assistant + Capture** + tap **D-Pad Right** | 1–3 quick taps (`0% / 4% / 8%`) |
+| **Check Battery Level** | Hold **Assistant + Capture** + tap **D-Pad Left** | 1–4 quick taps (`≤25% / 26–50% / 51–75% / 76–100%`; soft tap if gauge pending) |
 
-All settings (USB mode, mic gain, and stick deadzone) persist across reboots in NVS flash.
+All settings (USB mode, mic gain, stick deadzone, and last known battery level) persist across reboots in NVS flash.
 
 ## Status LED (XIAO Orange User LED)
 
 - **Slow heartbeat (100 ms / 1 s):** Waiting for Stadia Controller
 - **Solid ON:** Controller connected & mic active
+- **Double-dip OFF every 2 s:** Controller connected & **low battery (`≤ 15%`)**
 - **Steady blink (500 ms):** Controller connected & **mic muted**
 - **Fast blink (100 ms):** Holding a 2 s mode-switch combo
 
@@ -45,7 +50,7 @@ All settings (USB mode, mic gain, and stick deadzone) persist across reboots in 
 
 ## Flashing Pre-Built Firmware
 
-Download `stadiacast-esp32-v1.3.0-merged.bin` from the
+Download `stadiacast-esp32-v1.4.0-merged.bin` from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -62,7 +67,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.3.0-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.4.0-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -82,7 +87,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.3.0-merged.bin
+  0x0 stadiacast-esp32-v1.4.0-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -101,7 +106,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.3.0-merged.bin
+  0x0 stadiacast-esp32-v1.4.0-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -118,7 +123,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.3.0-merged.bin
+  0x0 stadiacast-esp32-v1.4.0-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:

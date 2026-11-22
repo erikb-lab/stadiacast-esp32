@@ -21,8 +21,10 @@
 #define NVS_NS_USB          "stadiacast"
 #define NVS_KEY_USB_MODE    "usb_mode"
 #define NVS_KEY_STICK_DZ    "stick_dz"
+#define NVS_KEY_LAST_BATT   "last_batt"
 
 #define INPUT_REPORT_ID     3
+#define BATTERY_REPORT_ID   4
 #define RUMBLE_REPORT_ID    5
 #define TRIGGER_THRESHOLD   30
 
@@ -109,7 +111,10 @@ _Static_assert(sizeof(xinput_report_t) == 20, "xinput_report_t must be 20 bytes"
 
 /* ---------------- Mode 0: Stadia HID (18d1:9400) Descriptors ---------------- */
 static const uint8_t s_hid_report_desc[] = {
-    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x03, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x81, 0x03, 0x05, 0x09, 0x09, 0x12, 0x09, 0x11, 0x09, 0x14, 0x09, 0x13, 0x09, 0x0D, 0x09, 0x0C, 0x09, 0x0B, 0x09, 0x0F, 0x09, 0x0E, 0x09, 0x08, 0x09, 0x07, 0x09, 0x05, 0x09, 0x04, 0x09, 0x02, 0x09, 0x01, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x15, 0x01, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0x05, 0x02, 0x09, 0xC5, 0x09, 0xC4, 0x15, 0x00, 0x95, 0x02, 0x81, 0x02, 0x85, 0x05, 0x06, 0x00, 0xFF, 0x09, 0x01, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x75, 0x10, 0x95, 0x02, 0x91, 0x02, 0xC0
+    0x05, 0x01, 0x09, 0x05, 0xA1, 0x01, 0x85, 0x03, 0x09, 0x39, 0x15, 0x00, 0x25, 0x07, 0x75, 0x04, 0x95, 0x01, 0x81, 0x42, 0x81, 0x03, 0x05, 0x09, 0x09, 0x12, 0x09, 0x11, 0x09, 0x14, 0x09, 0x13, 0x09, 0x0D, 0x09, 0x0C, 0x09, 0x0B, 0x09, 0x0F, 0x09, 0x0E, 0x09, 0x08, 0x09, 0x07, 0x09, 0x05, 0x09, 0x04, 0x09, 0x02, 0x09, 0x01, 0x25, 0x01, 0x75, 0x01, 0x95, 0x0F, 0x81, 0x02, 0x95, 0x01, 0x81, 0x03, 0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x35, 0x15, 0x01, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x04, 0x81, 0x02, 0x05, 0x02, 0x09, 0xC5, 0x09, 0xC4, 0x15, 0x00, 0x95, 0x02, 0x81, 0x02, 0x85, 0x05, 0x06, 0x00, 0xFF, 0x09, 0x01, 0x27, 0xFF, 0xFF, 0x00, 0x00, 0x75, 0x10, 0x95, 0x02, 0x91, 0x02,
+    /* Report ID 4: Battery Strength (Usage Page 0x06 Generic Device Controls, Usage 0x20, 0..100%) */
+    0x85, 0x04, 0x05, 0x06, 0x09, 0x20, 0x15, 0x00, 0x25, 0x64, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+    0xC0
 };
 
 static const tusb_desc_device_t s_hid_device_desc = {
@@ -229,6 +234,9 @@ static portMUX_TYPE s_hid_mux = portMUX_INITIALIZER_UNLOCKED;
 static stadia_hid_report_t s_latest_hid = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
 static xinput_report_t s_latest_xin = { .report_id = 0x00, .report_size = 0x14 };
 static bool s_dirty = false;
+static bool s_batt_dirty = false;
+static uint8_t s_battery_pct = 100; /* Last known 0..100% (persisted in NVS so UPower coldplug succeeds) */
+static int8_t  s_saved_batt_pct = -1;
 static bool s_kick_pending = false;
 static int64_t s_last_tx_us = 0;
 static usb_rumble_cb_t s_rumble_cb = NULL;
@@ -352,6 +360,8 @@ static void hid_flush_on_tusb_task(void *arg) {
     stadia_hid_report_t hid_rep;
     xinput_report_t xin_rep;
     bool should_send = false;
+    bool send_batt = false;
+    uint8_t batt_pct = 100;
 
     portENTER_CRITICAL(&s_hid_mux);
     s_kick_pending = false;
@@ -360,29 +370,42 @@ static void hid_flush_on_tusb_task(void *arg) {
         xin_rep = s_latest_xin;
         s_dirty = false;
         should_send = true;
+    } else if (s_batt_dirty && s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
+        batt_pct = s_battery_pct;
+        s_batt_dirty = false;
+        send_batt = true;
     }
     portEXIT_CRITICAL(&s_hid_mux);
 
-    if (!should_send) return;
-
-    if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
-        if (tud_mounted() && s_xin_ep_in && !usbd_edpt_busy(s_xin_rhport, s_xin_ep_in) &&
-            usbd_edpt_claim(s_xin_rhport, s_xin_ep_in)) {
-            memcpy(s_xin_tx_buf, &xin_rep, sizeof(xin_rep));
-            s_last_tx_us = esp_timer_get_time();
-            usbd_edpt_xfer(s_xin_rhport, s_xin_ep_in, s_xin_tx_buf, sizeof(xin_rep), false);
+    if (should_send) {
+        if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
+            if (tud_mounted() && s_xin_ep_in && !usbd_edpt_busy(s_xin_rhport, s_xin_ep_in) &&
+                usbd_edpt_claim(s_xin_rhport, s_xin_ep_in)) {
+                memcpy(s_xin_tx_buf, &xin_rep, sizeof(xin_rep));
+                s_last_tx_us = esp_timer_get_time();
+                usbd_edpt_xfer(s_xin_rhport, s_xin_ep_in, s_xin_tx_buf, sizeof(xin_rep), false);
+            } else {
+                portENTER_CRITICAL(&s_hid_mux);
+                s_dirty = true;
+                portEXIT_CRITICAL(&s_hid_mux);
+            }
         } else {
-            portENTER_CRITICAL(&s_hid_mux);
-            s_dirty = true;
-            portEXIT_CRITICAL(&s_hid_mux);
+            if (tud_mounted() && tud_hid_ready()) {
+                s_last_tx_us = esp_timer_get_time();
+                tud_hid_report(INPUT_REPORT_ID, &hid_rep, sizeof(hid_rep));
+            } else {
+                portENTER_CRITICAL(&s_hid_mux);
+                s_dirty = true;
+                portEXIT_CRITICAL(&s_hid_mux);
+            }
         }
-    } else {
+    } else if (send_batt) {
         if (tud_mounted() && tud_hid_ready()) {
-            s_last_tx_us = esp_timer_get_time();
-            tud_hid_report(INPUT_REPORT_ID, &hid_rep, sizeof(hid_rep));
+            uint8_t lvl = (uint8_t)batt_pct;
+            tud_hid_report(BATTERY_REPORT_ID, &lvl, sizeof(lvl));
         } else {
             portENTER_CRITICAL(&s_hid_mux);
-            s_dirty = true;
+            s_batt_dirty = true;
             portEXIT_CRITICAL(&s_hid_mux);
         }
     }
@@ -403,6 +426,13 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
         memcpy(buffer, &s_latest_hid, sizeof(s_latest_hid));
         portEXIT_CRITICAL(&s_hid_mux);
         return sizeof(s_latest_hid);
+    }
+    if (report_id == BATTERY_REPORT_ID && reqlen >= 1) {
+        portENTER_CRITICAL(&s_hid_mux);
+        uint8_t pct = s_battery_pct;
+        portEXIT_CRITICAL(&s_hid_mux);
+        buffer[0] = pct;
+        return 1;
     }
     return 0;
 }
@@ -633,6 +663,35 @@ uint16_t usb_gamepad_get_deadzone(void) {
     return s_stick_deadzone;
 }
 
+void usb_gamepad_set_battery(int pct) {
+    if (pct < 0) return; /* Keep last valid percentage for OS GET_REPORT queries */
+    uint8_t val = (uint8_t)(pct > 100 ? 100 : pct);
+    bool kick = false;
+    portENTER_CRITICAL(&s_hid_mux);
+    s_battery_pct = val;
+    if (s_usb_installed && s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
+        s_batt_dirty = true;
+        if (!s_kick_pending) {
+            s_kick_pending = true;
+            kick = true;
+        }
+    }
+    portEXIT_CRITICAL(&s_hid_mux);
+    if (kick) {
+        usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
+    }
+    if ((int8_t)val != s_saved_batt_pct) {
+        s_saved_batt_pct = (int8_t)val;
+        nvs_handle_t h;
+        if (nvs_open(NVS_NS_USB, NVS_READWRITE, &h) == ESP_OK) {
+            if (nvs_set_u8(h, NVS_KEY_LAST_BATT, val) == ESP_OK) {
+                (void)nvs_commit(h);
+            }
+            nvs_close(h);
+        }
+    }
+}
+
 void usb_gamepad_disconnect(void) {
     if (s_usb_installed) {
         tud_disconnect();
@@ -645,8 +704,13 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
     {
         nvs_handle_t h;
         uint16_t saved_dz = 0;
+        uint8_t saved_batt = 100;
         if (nvs_open(NVS_NS_USB, NVS_READONLY, &h) == ESP_OK) {
             (void)nvs_get_u16(h, NVS_KEY_STICK_DZ, &saved_dz);
+            if (nvs_get_u8(h, NVS_KEY_LAST_BATT, &saved_batt) == ESP_OK && saved_batt <= 100u) {
+                s_battery_pct = saved_batt;
+                s_saved_batt_pct = (int8_t)saved_batt;
+            }
             nvs_close(h);
         }
         if (saved_dz <= 8192u) s_stick_deadzone = saved_dz;

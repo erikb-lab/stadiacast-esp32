@@ -4,6 +4,7 @@
 #include "usb_audio.h"
 
 #include <errno.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -173,6 +174,12 @@ static bool g_last_set;
 static uint32_t g_last_buttons;
 static int32_t g_last_lx, g_last_ly, g_last_rx, g_last_ry;
 static uint32_t g_last_lt, g_last_rt;
+
+/* Controller battery telemetry (ControllerToDisplay #10, 0.0..1.0) */
+static int  g_battery_pct = -1; /* -1 = waiting for first gauge sample */
+static bool g_batt_warn_15 = false;
+static bool g_batt_warn_5  = false;
+static void haptic_start(int pulses, uint16_t strength);
 
 void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
                                  const char *cand_ip, uint16_t cand_port) {
@@ -912,14 +919,34 @@ static void handle_disp_rpc_request(uint32_t ticket, const uint8_t *payload, siz
     free(ctd);
 }
 
+static void handle_battery_float(float raw, const char *src) {
+    if (isnan(raw)) return;
+    if (raw < 0.0f) raw = 0.0f;
+    if (raw > 1.0f) raw = 1.0f;
+    int pct = (int)lroundf(raw * 100.0f);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (pct != g_battery_pct) {
+        g_battery_pct = pct;
+        ESP_LOGI(TAG, "Controller battery (%s): %d%%", src, pct);
+        usb_gamepad_set_battery(pct);
+    }
+    if (pct > 10) g_batt_warn_5 = false;
+    if (pct > 20) g_batt_warn_15 = false;
+}
+
 static void handle_disp_rpc_notification(const uint8_t *payload, size_t len) {
     gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(*ctd));
     if (!ctd) return;
     pb_istream_t is = pb_istream_from_buffer(payload, len);
-    if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd) &&
-        ctd->which_variant == gotham_display_ControllerToDisplay_message3_tag) {
-        const gotham_display_Message3 *m = &ctd->variant.message3;
-        dispatch_input(m->f1, m->f2, m->f3, m->f4, m->f5, m->f6, m->f7);
+    if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd)) {
+        if (ctd->which_variant == gotham_display_ControllerToDisplay_message3_tag) {
+            const gotham_display_Message3 *m = &ctd->variant.message3;
+            dispatch_input(m->f1, m->f2, m->f3, m->f4, m->f5, m->f6, m->f7);
+        } else if (ctd->which_variant == gotham_display_ControllerToDisplay_notification10_tag &&
+                   ctd->variant.notification10.has_value) {
+            handle_battery_float(ctd->variant.notification10.value, "notif10");
+        }
     }
     free(ctd);
 }
@@ -931,6 +958,17 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
     pb_istream_t is = pb_istream_from_buffer(resp->payload.bytes, resp->payload.size);
     if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd) &&
         ctd->which_variant == gotham_display_ControllerToDisplay_controller_state_tag) {
+        const gotham_display_GetControllerStateResponse *cs = &ctd->variant.controller_state;
+        if (cs->has_f10) {
+            float f10_val = 0.0f;
+            memcpy(&f10_val, &cs->f10, sizeof(f10_val));
+            ESP_LOGI(TAG, "ControllerState f10=0x%08lx (%.4f) f11=%lu",
+                     (unsigned long)cs->f10, (double)f10_val,
+                     (unsigned long)(cs->has_f11 ? cs->f11 : 0));
+            if (!isnan(f10_val) && f10_val >= 0.005f && f10_val <= 1.0f) {
+                handle_battery_float(f10_val, "state_f10");
+            }
+        }
         g_rpc_ready = true;
         ESP_LOGI(TAG, "===== READY! Starting game session for rumble =====");
         if (!g_start_game_sent) send_start_game_request();
@@ -1196,6 +1234,10 @@ static void pump_dtls(dtls_link_t *L) {
             g_rpc_ready = false;
             g_start_game_sent = false;
             g_last_set = false;
+            g_battery_pct = -1;
+            g_batt_warn_15 = false;
+            g_batt_warn_5 = false;
+            usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             link_reset(&g_game);
         }
@@ -1282,7 +1324,7 @@ static void status_led_init(void) {
     gpio_set_level(STATUS_LED_GPIO, 1); /* OFF (active-low) */
 }
 
-static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool combo_held) {
+static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool low_batt, bool combo_held) {
     static int s_last_level = -1;
     bool on;
     if (combo_held) {
@@ -1291,6 +1333,9 @@ static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool c
         on = (now_us % 1000000) < 100000;  /* Slow heartbeat: 100ms ON / 900ms OFF */
     } else if (mic_muted) {
         on = ((now_us / 500000) & 1) == 0; /* 500ms blink when connected & mic muted */
+    } else if (low_batt) {
+        int64_t t = now_us % 2000000;      /* Double-dip OFF every 2s when battery <= 15% */
+        on = !((t < 120000) || (t >= 240000 && t < 360000));
     } else {
         on = true;                         /* Solid ON when connected & mic active */
     }
@@ -1357,6 +1402,10 @@ static void stadia_transport_task(void *arg) {
             g_rpc_ready = false;
             g_start_game_sent = false;
             g_last_set = false;
+            g_battery_pct = -1;
+            g_batt_warn_15 = false;
+            g_batt_warn_5 = false;
+            usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             snprintf(g_disp.ctrl_ufrag, sizeof(g_disp.ctrl_ufrag), "%s", g_pending_ufrag);
             snprintf(g_disp.ctrl_pwd,   sizeof(g_disp.ctrl_pwd),   "%s", g_pending_pwd);
@@ -1395,6 +1444,18 @@ static void stadia_transport_task(void *arg) {
         {
             int64_t now_r = esp_timer_get_time();
             haptic_tick(now_r);
+            if (g_game.handshake_done && s_haptic_pulses_left <= 0 && g_battery_pct >= 0) {
+                if (g_battery_pct <= 5 && !g_batt_warn_5) {
+                    g_batt_warn_5 = true;
+                    g_batt_warn_15 = true;
+                    ESP_LOGW(TAG, "Controller battery CRITICAL (%d%%)", g_battery_pct);
+                    haptic_start(5, 0xA000);
+                } else if (g_battery_pct <= 15 && !g_batt_warn_15) {
+                    g_batt_warn_15 = true;
+                    ESP_LOGW(TAG, "Controller battery LOW (%d%%)", g_battery_pct);
+                    haptic_start(3, 0x8000);
+                }
+            }
             if (g_game.handshake_done && s_haptic_pulses_left <= 0) {
                 uint16_t rl = g_rumble_left_req;
                 uint16_t rr = g_rumble_right_req;
@@ -1412,10 +1473,12 @@ static void stadia_transport_task(void *arg) {
          *   Hold 2s: Assistant + Capture + X -> XInput     (2 buzzes, fast deauth reboot)
          *   Tap:     Assistant (XInput mode) OR Assistant + Capture (any mode) -> Mic mute toggle
          *   Tap:     Assistant + Capture + D-Pad Up / Down  -> Mic gain 1.0x / 1.5x / 2.0x / 2.5x
-         *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8% */
+         *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8%
+         *   Tap:     Assistant + Capture + D-Pad Left       -> Battery check (1-4 buzzes = quartile; soft buzz = unknown) */
         {
             const uint32_t btn_up     = (1u << 0);
             const uint32_t btn_down   = (1u << 1);
+            const uint32_t btn_left   = (1u << 2);
             const uint32_t btn_right  = (1u << 3);
             const uint32_t btn_asst   = (1u << 10);
             const uint32_t btn_cap    = (1u << 11);
@@ -1481,6 +1544,18 @@ static void stadia_transport_task(void *arg) {
                     ESP_LOGI(TAG, "Stick deadzone -> %u%%", (unsigned)(idx * 4));
                     haptic_start(idx + 1, 0x7000);
                     s_asst_chord_used = true;
+                } else if (rising & btn_left) {
+                    if (g_battery_pct < 0) {
+                        ESP_LOGI(TAG, "Battery check: unknown (waiting for controller gauge)");
+                        haptic_start(1, 0x3500);
+                    } else {
+                        int pulses = (g_battery_pct >= 76) ? 4 :
+                                     (g_battery_pct >= 51) ? 3 :
+                                     (g_battery_pct >= 26) ? 2 : 1;
+                        ESP_LOGI(TAG, "Battery check: %d%% (%d pulses)", g_battery_pct, pulses);
+                        haptic_start(pulses, 0x8000);
+                    }
+                    s_asst_chord_used = true;
                 }
             }
 
@@ -1525,7 +1600,8 @@ static void stadia_transport_task(void *arg) {
             }
 
             s_prev_btn = cur;
-            status_led_update(now, g_rpc_ready, usb_audio_is_mic_muted(), s_combo_active != 0);
+            bool low_batt = (g_battery_pct >= 0 && g_battery_pct <= 15);
+            status_led_update(now, g_rpc_ready, usb_audio_is_mic_muted(), low_batt, s_combo_active != 0);
         }
 
         service_audio_tx();
