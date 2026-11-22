@@ -49,7 +49,7 @@ All settings (USB mode, mic gain, stick deadzone, and last known battery level) 
 ## Hardware
 
 - **Seeed Studio XIAO ESP32-S3** (8 MB Flash, 8 MB OPI PSRAM)
-- **Google Stadia Controller** running original **Wi-Fi firmware** (not converted to Bluetooth)
+- **Google Stadia Controller** running its **Wi-Fi firmware** *(controllers previously switched to Bluetooth mode can be flashed back to Wi-Fi firmware using community flasher tools; this dongle itself never flashes the controller)*
   - SoftAP SSID: `STADIA_ESP32`
   - SoftAP Password: `stadiacast`
 
