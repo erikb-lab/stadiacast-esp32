@@ -1,6 +1,9 @@
 """Cross-decode C-encoded nanopb blobs using Python Stadiacast's protobuf classes."""
 import sys, os
-sys.path.insert(0, "/home/erik/esp/stadiacast/src")
+
+REPO_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+STADIACAST_SRC = os.environ.get("STADIACAST_SRC", os.path.join(REPO_DIR, "..", "stadiacast", "src"))
+sys.path.insert(0, STADIACAST_SRC)
 from stadiacast.protos import Protos
 from stadiacast.config import Config
 import google.protobuf.text_format as tf
@@ -13,11 +16,11 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 
 # Load protos from stadiacast schemas
 import subprocess
-BLOB_DIR = "/home/erik/esp/.tmp"
+BLOB_DIR = os.environ.get("BLOB_DIR", os.path.join(REPO_DIR, ".tmp"))
 
 def load_proto(name):
     # Use stadiacast's own compiled descriptors if available
-    desc_path = f"/home/erik/esp/stadiacast/src/stadiacast/schemas/{name.replace('.proto','.descriptor')}"
+    desc_path = os.path.join(STADIACAST_SRC, "stadiacast", "schemas", name.replace(".proto", ".descriptor"))
     if os.path.exists(desc_path):
         pool = descriptor_pool.DescriptorPool()
         fdp = descriptor_pb2.FileDescriptorProto()

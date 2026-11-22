@@ -15,8 +15,12 @@
 
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); return 1; } else { printf("OK:   %s\n", msg); } } while(0)
 
-/* Helper: write blob to file for Python cross-decode */
-static void write_blob(const char *path, const uint8_t *buf, size_t len) {
+/* Helper: write blob to BLOB_DIR (default .tmp) for Python cross-decode */
+static void write_blob(const char *name, const uint8_t *buf, size_t len) {
+    const char *dir = getenv("BLOB_DIR");
+    if (!dir || !dir[0]) dir = ".tmp";
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
     FILE *f = fopen(path, "wb");
     if (f) { fwrite(buf, 1, len, f); fclose(f); }
 }
@@ -40,7 +44,7 @@ int main(void) {
         CHECK(pb_encode(&stream, gotham_discovery_RegisterControllerResponse_fields, &msg),
               "encode RegisterControllerResponse");
         printf("  encoded %zu bytes\n", stream.bytes_written);
-        write_blob("/home/erik/esp/.tmp/reg_resp.bin", buf, stream.bytes_written);
+        write_blob("reg_resp.bin", buf, stream.bytes_written);
 
         gotham_discovery_RegisterControllerResponse dec = gotham_discovery_RegisterControllerResponse_init_zero;
         pb_istream_t istream = pb_istream_from_buffer(buf, stream.bytes_written);
@@ -80,7 +84,7 @@ int main(void) {
         CHECK(pb_encode(&stream, gotham_rpc_RpcMessage_fields, &msg),
               "encode RpcMessage (request)");
         printf("  encoded %zu bytes\n", stream.bytes_written);
-        write_blob("/home/erik/esp/.tmp/rpc_msg.bin", buf, stream.bytes_written);
+        write_blob("rpc_msg.bin", buf, stream.bytes_written);
 
         gotham_rpc_RpcMessage dec = gotham_rpc_RpcMessage_init_zero;
         pb_istream_t istream = pb_istream_from_buffer(buf, stream.bytes_written);
@@ -116,7 +120,7 @@ int main(void) {
         CHECK(pb_encode(&stream, gotham_discovery_GmsgEnvelope_fields, &env),
               "encode GmsgEnvelope (type=42 + ext 269197544)");
         printf("  encoded %zu bytes\n", stream.bytes_written);
-        write_blob("/home/erik/esp/.tmp/gmsg_env.bin", buf, stream.bytes_written);
+        write_blob("gmsg_env.bin", buf, stream.bytes_written);
 
         gotham_discovery_GmsgEnvelope dec = gotham_discovery_GmsgEnvelope_init_zero;
         pb_extension_t dec_ext = pb_extension_init_zero;
@@ -147,7 +151,7 @@ int main(void) {
         CHECK(pb_encode(&stream, gotham_display_GetCurrentTimeResponse_fields, &tmsg),
               "encode GetCurrentTimeResponse (#21)");
         printf("  encoded %zu bytes\n", stream.bytes_written);
-        write_blob("/home/erik/esp/.tmp/time_resp.bin", buf, stream.bytes_written);
+        write_blob("time_resp.bin", buf, stream.bytes_written);
 
         gotham_display_GetCurrentTimeResponse dec = gotham_display_GetCurrentTimeResponse_init_zero;
         pb_istream_t istream = pb_istream_from_buffer(buf, stream.bytes_written);
@@ -172,7 +176,7 @@ int main(void) {
         CHECK(pb_encode(&stream, gotham_display_Message3_fields, &msg),
               "encode Message3 (InputReport #3)");
         printf("  encoded %zu bytes\n", stream.bytes_written);
-        write_blob("/home/erik/esp/.tmp/input_report.bin", buf, stream.bytes_written);
+        write_blob("input_report.bin", buf, stream.bytes_written);
 
         gotham_display_Message3 dec = gotham_display_Message3_init_zero;
         pb_istream_t istream = pb_istream_from_buffer(buf, stream.bytes_written);
