@@ -23,6 +23,7 @@ bool stadia_transport_is_ready(void);
 bool stadia_transport_is_slot_ready(int slot);
 int  stadia_transport_get_battery_pct(void);
 int  stadia_transport_get_slot_battery_pct(int slot);
+uint32_t stadia_transport_get_slot_peer_ip(int slot);
 bool stadia_transport_is_headset_plugged(void);
 int  stadia_transport_get_connected_count(void);
 

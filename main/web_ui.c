@@ -22,8 +22,23 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "lwip/sockets.h"
 
 #define TAG "WEBUI"
+
+static uint32_t get_req_client_ip4(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return 0;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&ss)->sin_addr.s_addr;
+    } else if (ss.ss_family == AF_INET6) {
+        return ((struct sockaddr_in6 *)&ss)->sin6_addr.un.u32_addr[3];
+    }
+    return 0;
+}
 
 static void delayed_reboot_task(void *arg) {
     bool to_boot = (arg != NULL);
@@ -274,6 +289,8 @@ static esp_err_t get_api_status(httpd_req_t *req) {
     cJSON *root = cJSON_CreateObject();
     if (!root) return send_json(req, "500 Internal Server Error", "{\"ok\":false}");
 
+    uint32_t client_ip = get_req_client_ip4(req);
+    int rssi0 = wifi_ap_get_peer_rssi(stadia_transport_get_slot_peer_ip(0), client_ip);
     uint8_t max_p = usb_gamepad_get_max_players();
     cJSON_AddStringToObject(root, "version", app ? app->version : "unknown");
     cJSON_AddStringToObject(root, "slot", running ? running->label : "unknown");
@@ -284,6 +301,7 @@ static esp_err_t get_api_status(httpd_req_t *req) {
     cJSON_AddNumberToObject(root, "total_psram", (double)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     cJSON_AddBoolToObject(root, "ready", stadia_transport_is_ready());
     cJSON_AddNumberToObject(root, "battery_pct", stadia_transport_get_battery_pct());
+    cJSON_AddNumberToObject(root, "rssi_dbm", rssi0);
     cJSON_AddBoolToObject(root, "headset", stadia_transport_is_headset_plugged());
     cJSON_AddNumberToObject(root, "usb_mode", (int)usb_gamepad_get_mode());
     cJSON_AddNumberToObject(root, "max_players", (int)max_p);
@@ -294,8 +312,10 @@ static esp_err_t get_api_status(httpd_req_t *req) {
         for (int i = 0; i < (int)max_p; i++) {
             cJSON *po = cJSON_CreateObject();
             if (po) {
+                int prssi = wifi_ap_get_peer_rssi(stadia_transport_get_slot_peer_ip(i), client_ip);
                 cJSON_AddBoolToObject(po, "ready", stadia_transport_is_slot_ready(i));
                 cJSON_AddNumberToObject(po, "batt", stadia_transport_get_slot_battery_pct(i));
+                cJSON_AddNumberToObject(po, "rssi", prssi);
                 cJSON_AddItemToArray(parr, po);
             }
         }
@@ -543,11 +563,14 @@ static esp_err_t get_api_input(httpd_req_t *req) {
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
     uint8_t lt = 0, rt = 0;
     usb_gamepad_get_latest_input_slot(slot, &b, &lx, &ly, &rx, &ry, &lt, &rt);
-    char buf[140];
+    int rssi = wifi_ap_get_peer_rssi(stadia_transport_get_slot_peer_ip(slot), get_req_client_ip4(req));
+    int batt = stadia_transport_get_slot_battery_pct(slot);
+    char buf[180];
     snprintf(buf, sizeof(buf),
-             "{\"slot\":%d,\"ready\":%s,\"b\":%lu,\"lx\":%ld,\"ly\":%ld,\"rx\":%ld,\"ry\":%ld,\"lt\":%u,\"rt\":%u}",
+             "{\"slot\":%d,\"ready\":%s,\"rssi\":%d,\"batt\":%d,\"b\":%lu,\"lx\":%ld,\"ly\":%ld,\"rx\":%ld,\"ry\":%ld,\"lt\":%u,\"rt\":%u}",
              slot,
              stadia_transport_is_slot_ready(slot) ? "true" : "false",
+             rssi, batt,
              (unsigned long)b, (long)lx, (long)ly, (long)rx, (long)ry,
              (unsigned)lt, (unsigned)rt);
     return send_json(req, "200 OK", buf);

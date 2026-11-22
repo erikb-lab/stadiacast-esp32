@@ -219,6 +219,17 @@ int stadia_transport_get_slot_battery_pct(int slot) {
     return g_players[slot].battery_pct;
 }
 
+uint32_t stadia_transport_get_slot_peer_ip(int slot) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) return 0;
+    if (g_players[slot].disp.peer_seen && g_players[slot].disp.peer.sin_addr.s_addr != 0) {
+        return g_players[slot].disp.peer.sin_addr.s_addr;
+    }
+    if (g_players[slot].pending_cand_valid && g_players[slot].pending_cand.sin_addr.s_addr != 0) {
+        return g_players[slot].pending_cand.sin_addr.s_addr;
+    }
+    return stadia_sessions[slot].peer_ip;
+}
+
 int stadia_transport_get_battery_pct(void) {
     return g_players[0].battery_pct;
 }

@@ -21,6 +21,15 @@
 static char   s_ap_ssid[33] = WIFI_AP_DEFAULT_SSID;
 static char   s_ap_pass[64] = WIFI_AP_DEFAULT_PASS;
 static int8_t s_ap_tx_qdbm  = WIFI_AP_DEFAULT_TX_QDBM;
+static esp_netif_t *s_ap_netif = NULL;
+
+typedef struct {
+    uint8_t  mac[6];
+    uint32_t ip4;
+    bool     used;
+} sta_ip_map_t;
+
+static sta_ip_map_t s_sta_ips[8];
 
 static void wifi_ap_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
     (void)arg;
@@ -31,10 +40,28 @@ static void wifi_ap_event_handler(void *arg, esp_event_base_t base, int32_t id, 
                  e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
         wifi_event_ap_stadisconnected_t *e = data;
+        for (int i = 0; i < 8; i++) {
+            if (s_sta_ips[i].used && memcmp(s_sta_ips[i].mac, e->mac, 6) == 0) {
+                s_sta_ips[i].used = false;
+            }
+        }
         ESP_LOGI(TAG, "STA disconnected: MAC %02x:%02x:%02x:%02x:%02x:%02x",
                  e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
     } else if (base == IP_EVENT && id == IP_EVENT_AP_STAIPASSIGNED) {
         ip_event_ap_staipassigned_t *e = data;
+        int slot = -1;
+        for (int i = 0; i < 8; i++) {
+            if (s_sta_ips[i].used && memcmp(s_sta_ips[i].mac, e->mac, 6) == 0) {
+                slot = i;
+                break;
+            }
+            if (!s_sta_ips[i].used && slot < 0) slot = i;
+        }
+        if (slot >= 0) {
+            memcpy(s_sta_ips[slot].mac, e->mac, 6);
+            s_sta_ips[slot].ip4 = e->ip.addr;
+            s_sta_ips[slot].used = true;
+        }
         char ip_str[32];
         esp_ip4addr_ntoa(&e->ip, ip_str, sizeof(ip_str));
         ESP_LOGI(TAG, "STA IP assigned: %s", ip_str);
@@ -126,7 +153,7 @@ void wifi_ap_init(void) {
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    s_ap_netif = esp_netif_create_default_wifi_ap();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -159,4 +186,45 @@ void wifi_ap_init(void) {
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
     ESP_LOGI(TAG, "SoftAP up: SSID=%s, IP=192.168.4.1, HT20, +%d.%02ddBm, WPA2-PSK, no PMF",
              s_ap_ssid, s_ap_tx_qdbm / 4, (s_ap_tx_qdbm % 4) * 25);
+}
+
+int wifi_ap_get_peer_rssi(uint32_t peer_ip4, uint32_t exclude_ip4) {
+    wifi_sta_list_t sta_list = {0};
+    if (esp_wifi_ap_get_sta_list(&sta_list) != ESP_OK || sta_list.num <= 0) {
+        return -127;
+    }
+
+    esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM] = {0};
+    int n = sta_list.num < ESP_WIFI_MAX_CONN_NUM ? sta_list.num : ESP_WIFI_MAX_CONN_NUM;
+    for (int i = 0; i < n; i++) {
+        memcpy(pairs[i].mac, sta_list.sta[i].mac, 6);
+    }
+    if (s_ap_netif) {
+        (void)esp_netif_dhcps_get_clients_by_mac(s_ap_netif, n, pairs);
+    }
+    for (int i = 0; i < n; i++) {
+        if (pairs[i].ip.addr == 0) {
+            for (int j = 0; j < 8; j++) {
+                if (s_sta_ips[j].used && memcmp(s_sta_ips[j].mac, pairs[i].mac, 6) == 0) {
+                    pairs[i].ip.addr = s_sta_ips[j].ip4;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (peer_ip4 != 0) {
+        for (int i = 0; i < n; i++) {
+            if (pairs[i].ip.addr == peer_ip4) {
+                return (int)sta_list.sta[i].rssi;
+            }
+        }
+    }
+
+    for (int i = 0; i < n; i++) {
+        if (exclude_ip4 == 0 || pairs[i].ip.addr != exclude_ip4) {
+            return (int)sta_list.sta[i].rssi;
+        }
+    }
+    return -127;
 }
