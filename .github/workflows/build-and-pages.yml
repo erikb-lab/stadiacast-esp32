@@ -41,14 +41,7 @@ jobs:
           fi
           printf '%s' "$STADIA_PRIVKEY_B64" | base64 -d > main/certs/privkey.pem
 
-      - name: Build ESP32-S3 firmware
-        run: |
-          . /opt/esp/idf/export.sh
-          rm -f sdkconfig
-          idf.py set-target esp32s3
-          idf.py build
-
-      - name: Package merged binary, WebSerial manifest, and GitHub Pages site
+      - name: Build all ESP32-S3 board variants (8MB OPI, 4MB+ Quad PSRAM, 4MB+ No-PSRAM)
         id: meta
         run: |
           . /opt/esp/idf/export.sh
@@ -65,24 +58,57 @@ jobs:
           VER="${VER:-dev}"
           echo "version=$VER" >> "$GITHUB_OUTPUT"
 
+          # 1. Default Target: 8MB Flash + 8MB Octal (OPI) PSRAM (XIAO ESP32-S3, DevKitC-1 N8R8/N16R8)
+          rm -rf build sdkconfig
+          idf.py -B build_octal -DSDKCONFIG_DEFAULTS="sdkconfig.defaults" set-target esp32s3
+          idf.py -B build_octal build
           python -m esptool --chip esp32s3 merge_bin \
             -o _site/firmware/stadiacast-esp32-merged.bin \
             --flash_mode dio --flash_freq 80m --flash_size 8MB \
-            0x0 build/bootloader/bootloader.bin \
-            0x8000 build/partition_table/partition-table.bin \
-            0xf000 build/ota_data_initial.bin \
-            0x20000 build/stadiacast-esp32.bin
+            0x0 build_octal/bootloader/bootloader.bin \
+            0x8000 build_octal/partition_table/partition-table.bin \
+            0xf000 build_octal/ota_data_initial.bin \
+            0x20000 build_octal/stadiacast-esp32.bin
+          cp build_octal/stadiacast-esp32.bin _site/firmware/stadiacast-esp32.bin
+          rm -rf build_octal sdkconfig
 
-          cp build/stadiacast-esp32.bin _site/firmware/stadiacast-esp32.bin
+          # 2. Quad PSRAM Target: 4MB+ Flash + 2MB Quad PSRAM (S3-Zero, S3-SuperMini, Lolin S3 Mini, S3-GEEK, QT Py S3)
+          idf.py -B build_quad -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.quad" set-target esp32s3
+          idf.py -B build_quad build
+          python -m esptool --chip esp32s3 merge_bin \
+            -o _site/firmware/stadiacast-esp32-s3-quad-merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x0 build_quad/bootloader/bootloader.bin \
+            0x8000 build_quad/partition_table/partition-table.bin \
+            0xf000 build_quad/ota_data_initial.bin \
+            0x20000 build_quad/stadiacast-esp32.bin
+          cp build_quad/stadiacast-esp32.bin _site/firmware/stadiacast-esp32-s3-quad.bin
+          rm -rf build_quad sdkconfig
+
+          # 3. No-PSRAM Target: 4MB+ Flash + 512KB Internal SRAM (T-Dongle-S3, M5Stack AtomS3U, StampS3)
+          idf.py -B build_nopsram -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.defaults.nopsram" set-target esp32s3
+          idf.py -B build_nopsram build
+          python -m esptool --chip esp32s3 merge_bin \
+            -o _site/firmware/stadiacast-esp32-s3-nopsram-merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 4MB \
+            0x0 build_nopsram/bootloader/bootloader.bin \
+            0x8000 build_nopsram/partition_table/partition-table.bin \
+            0xf000 build_nopsram/ota_data_initial.bin \
+            0x20000 build_nopsram/stadiacast-esp32.bin
+          cp build_nopsram/stadiacast-esp32.bin _site/firmware/stadiacast-esp32-s3-nopsram.bin
+          rm -rf build_nopsram sdkconfig
+
           cp web/index.html _site/index.html
 
           SHA256_MERGED=$(sha256sum _site/firmware/stadiacast-esp32-merged.bin | awk '{print $1}')
           SHA256_APP=$(sha256sum _site/firmware/stadiacast-esp32.bin | awk '{print $1}')
+          SHA256_QUAD_MERGED=$(sha256sum _site/firmware/stadiacast-esp32-s3-quad-merged.bin | awk '{print $1}')
+          SHA256_NOPSRAM_MERGED=$(sha256sum _site/firmware/stadiacast-esp32-s3-nopsram-merged.bin | awk '{print $1}')
           BUILT_AT=$(date -u +"%Y-%m-%d %H:%M UTC")
 
           cat > _site/manifest.json <<EOF
           {
-            "name": "Stadia Wireless Adapter",
+            "name": "Stadia Wireless Adapter (XIAO ESP32-S3 / 8MB OPI)",
             "version": "v${VER}",
             "new_install_prompt_erase": false,
             "builds": [
@@ -96,17 +122,51 @@ jobs:
           }
           EOF
 
+          cat > _site/manifest-s3-quad.json <<EOF
+          {
+            "name": "Stadia Wireless Adapter (ESP32-S3 4MB + 2MB Quad PSRAM)",
+            "version": "v${VER}",
+            "new_install_prompt_erase": false,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "firmware/stadiacast-esp32-s3-quad-merged.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+          cat > _site/manifest-s3-nopsram.json <<EOF
+          {
+            "name": "Stadia Wireless Adapter (ESP32-S3 No-PSRAM)",
+            "version": "v${VER}",
+            "new_install_prompt_erase": false,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "firmware/stadiacast-esp32-s3-nopsram-merged.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+
           cat > _site/version.json <<EOF
           {
             "version": "v${VER}",
             "sha": "${GITHUB_SHA}",
             "built_at": "${BUILT_AT}",
             "sha256_merged": "${SHA256_MERGED}",
-            "sha256_app": "${SHA256_APP}"
+            "sha256_app": "${SHA256_APP}",
+            "sha256_quad_merged": "${SHA256_QUAD_MERGED}",
+            "sha256_nopsram_merged": "${SHA256_NOPSRAM_MERGED}"
           }
           EOF
 
-          (cd _site/firmware && sha256sum stadiacast-esp32-merged.bin stadiacast-esp32.bin > SHA256SUMS.txt)
+          (cd _site/firmware && sha256sum *.bin > SHA256SUMS.txt)
 
       - name: Upload GitHub Pages artifact
         if: github.ref == 'refs/heads/main'
@@ -151,10 +211,23 @@ jobs:
           REPO="${{ github.repository }}"
           cp dist/stadiacast-esp32-merged.bin "stadiacast-esp32-${TAG}-merged.bin"
           cp dist/stadiacast-esp32.bin "stadiacast-esp32.bin"
-          sha256sum "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" > SHA256SUMS.txt
+          cp dist/stadiacast-esp32-s3-quad-merged.bin "stadiacast-esp32-s3-quad-${TAG}-merged.bin"
+          cp dist/stadiacast-esp32-s3-quad.bin "stadiacast-esp32-s3-quad.bin"
+          cp dist/stadiacast-esp32-s3-nopsram-merged.bin "stadiacast-esp32-s3-nopsram-${TAG}-merged.bin"
+          cp dist/stadiacast-esp32-s3-nopsram.bin "stadiacast-esp32-s3-nopsram.bin"
+          sha256sum *.bin > SHA256SUMS.txt
+          ASSETS=(
+            "stadiacast-esp32-${TAG}-merged.bin"
+            "stadiacast-esp32.bin"
+            "stadiacast-esp32-s3-quad-${TAG}-merged.bin"
+            "stadiacast-esp32-s3-quad.bin"
+            "stadiacast-esp32-s3-nopsram-${TAG}-merged.bin"
+            "stadiacast-esp32-s3-nopsram.bin"
+            "SHA256SUMS.txt"
+          )
           if gh release view "$TAG" -R "$REPO" >/dev/null 2>&1; then
-            gh release upload "$TAG" -R "$REPO" "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" SHA256SUMS.txt --clobber
+            gh release upload "$TAG" -R "$REPO" "${ASSETS[@]}" --clobber
           else
-            gh release create "$TAG" -R "$REPO" "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" SHA256SUMS.txt \
+            gh release create "$TAG" -R "$REPO" "${ASSETS[@]}" \
               --title "${TAG}" --generate-notes
           fi

@@ -10,7 +10,13 @@
 #define TAG "USB_AUDIO"
 
 /* Power-of-2 lock-free SPSC byte buffer for USB Speaker OUT (48kHz stereo s16le = 192B/ms) */
+#if CONFIG_SPIRAM
+#define STADIA_EXT_BSS        EXT_RAM_BSS_ATTR
 #define SPK_SPSC_CAP          8192u /* ~42 ms */
+#else
+#define STADIA_EXT_BSS
+#define SPK_SPSC_CAP          4096u /* ~21 ms */
+#endif
 #define SPK_OPUS_FRAME_BYTES  (STADIA_FRAME_SAMPLES * STADIA_SPK_CHANNELS * sizeof(int16_t)) /* 3840 B */
 
 typedef struct {
@@ -21,7 +27,7 @@ typedef struct {
     atomic_uint_fast32_t drops;
 } spsc_byte_buf_t;
 
-static EXT_RAM_BSS_ATTR uint8_t s_spk_mem[SPK_SPSC_CAP] __attribute__((aligned(4)));
+static STADIA_EXT_BSS uint8_t s_spk_mem[SPK_SPSC_CAP] __attribute__((aligned(4)));
 static spsc_byte_buf_t s_spk_buf = {
     .buf = s_spk_mem,
     .capacity = SPK_SPSC_CAP,

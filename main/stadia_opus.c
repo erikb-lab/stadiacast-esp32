@@ -23,9 +23,16 @@ extern void stadia_transport_wake(void);
 #define PKT_RING_MASK   (PKT_RING_SLOTS - 1u)
 
 /* Power-of-2 PCM sample rings (2-chunk memcpy, wrap-safe forever, ISR-safe for mic consumer) */
+#if CONFIG_SPIRAM
+#define STADIA_EXT_BSS  EXT_RAM_BSS_ATTR
 #define SPK_RING_CAP    8192u  /* 4096 stereo frames (~85 ms @ 48kHz) */
-#define SPK_RING_MASK   (SPK_RING_CAP - 1u)
 #define MIC_RING_CAP    4096u  /* 4096 mono samples  (~85 ms @ 48kHz) */
+#else
+#define STADIA_EXT_BSS
+#define SPK_RING_CAP    4096u  /* 2048 stereo frames (~42 ms @ 48kHz) */
+#define MIC_RING_CAP    2048u  /* 2048 mono samples  (~42 ms @ 48kHz) */
+#endif
+#define SPK_RING_MASK   (SPK_RING_CAP - 1u)
 #define MIC_RING_MASK   (MIC_RING_CAP - 1u)
 
 typedef struct {
@@ -33,17 +40,17 @@ typedef struct {
     uint8_t  data[STADIA_MAX_OPUS_PKT_BYTES];
 } opus_slot_t;
 
-/* Lock-free SPSC packet rings (Core 0 <-> Core 1) in OPI PSRAM to save internal DRAM */
-static EXT_RAM_BSS_ATTR opus_slot_t s_rx_ring[PKT_RING_SLOTS];
+/* Lock-free SPSC packet rings (Core 0 <-> Core 1) in OPI PSRAM when available */
+static STADIA_EXT_BSS opus_slot_t s_rx_ring[PKT_RING_SLOTS];
 static atomic_uint   s_rx_head = ATOMIC_VAR_INIT(0);
 static atomic_uint   s_rx_tail = ATOMIC_VAR_INIT(0);
 
-static EXT_RAM_BSS_ATTR opus_slot_t s_tx_ring[PKT_RING_SLOTS];
+static STADIA_EXT_BSS opus_slot_t s_tx_ring[PKT_RING_SLOTS];
 static atomic_uint   s_tx_head = ATOMIC_VAR_INIT(0);
 static atomic_uint   s_tx_tail = ATOMIC_VAR_INIT(0);
 
 /* Lock-free SPSC PCM sample rings */
-static EXT_RAM_BSS_ATTR int16_t s_spk_pcm[SPK_RING_CAP];
+static STADIA_EXT_BSS int16_t s_spk_pcm[SPK_RING_CAP];
 static atomic_uint   s_spk_head = ATOMIC_VAR_INIT(0);
 static atomic_uint   s_spk_tail = ATOMIC_VAR_INIT(0);
 
@@ -56,9 +63,9 @@ static atomic_uint_fast16_t s_mic_gain_q8 = ATOMIC_VAR_INIT(256u); /* 256 = 1.0x
 static TaskHandle_t         s_opus_task = NULL;
 
 /* Scratch frame buffers for Core 1 worker */
-static EXT_RAM_BSS_ATTR int16_t s_dec_mono[STADIA_FRAME_SAMPLES];
-static EXT_RAM_BSS_ATTR int16_t s_enc_stereo[STADIA_FRAME_SAMPLES * STADIA_SPK_CHANNELS];
-static EXT_RAM_BSS_ATTR uint8_t s_enc_pkt[STADIA_MAX_OPUS_PKT_BYTES];
+static STADIA_EXT_BSS int16_t s_dec_mono[STADIA_FRAME_SAMPLES];
+static STADIA_EXT_BSS int16_t s_enc_stereo[STADIA_FRAME_SAMPLES * STADIA_SPK_CHANNELS];
+static STADIA_EXT_BSS uint8_t s_enc_pkt[STADIA_MAX_OPUS_PKT_BYTES];
 
 void stadia_opus_set_loopback(bool enable) {
     atomic_store(&s_loopback, enable);

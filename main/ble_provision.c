@@ -60,8 +60,18 @@ static const ble_uuid128_t UUID_WIN_CRYPTO_DATA = BLE_UUID128_INIT(
 
 #define WINDOW_PAGE_SIZE  512
 #define WINDOW_MAX_PAGES  24
+#if CONFIG_SPIRAM
 #define CRYPTO_RAW_CAP    16384
 #define CRYPTO_JSON_CAP   32768
+#else
+#define CRYPTO_RAW_CAP    8192
+#define CRYPTO_JSON_CAP   14336
+#endif
+
+static void *ble_alloc(size_t sz) {
+    void *p = heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(sz);
+}
 
 static portMUX_TYPE s_stat_mux = portMUX_INITIALIZER_UNLOCKED;
 static char s_status_str[96] = "Initializing BLE...";
@@ -327,8 +337,8 @@ static size_t gunzip_to_buf(const uint8_t *in, size_t in_len, uint8_t *out, size
     if (off + 8 >= in_len) return 0;
 
     size_t deflate_len = in_len - off - 8; /* Exclude 8-byte CRC32+ISIZE trailer */
-    /* Allocate 11 KB tinfl_decompressor in PSRAM so we never overflow the task stack */
-    tinfl_decompressor *decomp = heap_caps_malloc(sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    /* Allocate 11 KB tinfl_decompressor on heap (PSRAM when available) so we never overflow the task stack */
+    tinfl_decompressor *decomp = ble_alloc(sizeof(tinfl_decompressor));
     if (!decomp) return 0;
     tinfl_init(decomp);
     size_t in_bytes = deflate_len;
@@ -364,8 +374,8 @@ static bool encrypt_pass_from_bundle(const char *json_str, const char *pass,
 
     const char *pk_b64 = pk_item->valuestring;
     size_t der_len = 0;
-    uint8_t *der = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *ct  = heap_caps_malloc(512,  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *der = ble_alloc(1024);
+    uint8_t *ct  = ble_alloc(512);
     if (!der || !ct) {
         free(der);
         free(ct);
@@ -433,8 +443,8 @@ static bool provision_target(void) {
     }
 
     bool ok = false;
-    uint8_t *raw_buf = heap_caps_malloc(CRYPTO_RAW_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t *json_buf = heap_caps_malloc(CRYPTO_JSON_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    uint8_t *raw_buf = ble_alloc(CRYPTO_RAW_CAP);
+    uint8_t *json_buf = ble_alloc(CRYPTO_JSON_CAP);
     if (!raw_buf || !json_buf) {
         set_status("BLE provision OOM");
         goto cleanup;

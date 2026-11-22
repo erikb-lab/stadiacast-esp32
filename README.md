@@ -52,12 +52,32 @@ All settings (USB mode, mic gain, stick deadzone, and last known battery level) 
 - **Steady blink (500 ms):** Controller connected & **mic muted**
 - **Fast blink (100 ms):** Holding a 2 s mode-switch combo
 
-## Hardware
+## Supported ESP32-S3 Boards
 
-- **Seeed Studio XIAO ESP32-S3** (8 MB Flash, 8 MB OPI PSRAM)
+GitHub Actions automatically builds **3 firmware variants** on every commit and release so almost any ESP32-S3 board with native USB-OTG (`GPIO 19/20`) works with **zero external hardware**:
+
+| Board (Amazon Link) | Chip / Flash / PSRAM | USB Port to Use | Firmware Target | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| **[Seeed Studio XIAO ESP32-S3](https://www.amazon.com/s?k=Seeed+Studio+XIAO+ESP32-S3)** | `S3R8` · 8 MB Flash · **8 MB OPI PSRAM** | USB-C | `stadiacast-esp32` *(Default 8MB OPI)* | <!-- board:xiao-s3 --> ✅ Tested & Working |
+| **[Waveshare ESP32-S3-Zero](https://www.amazon.com/s?k=Waveshare+ESP32-S3-Zero)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:waveshare-s3-zero --> 🧪 Untested |
+| **[ESP32-S3 SuperMini / ProMini](https://www.amazon.com/s?k=ESP32-S3+SuperMini+Development+Board)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:s3-supermini --> 🧪 Untested |
+| **[Wemos / Lolin S3 Mini](https://www.amazon.com/s?k=Lolin+S3+Mini+ESP32-S3)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:lolin-s3-mini --> 🧪 Untested |
+| **[Waveshare ESP32-S3-GEEK (USB-A Stick)](https://www.amazon.com/s?k=Waveshare+ESP32-S3-GEEK)** | `S3RH2` · 16 MB Flash · **2 MB Quad PSRAM** | Built-in USB-A | `stadiacast-esp32-s3-quad` | <!-- board:waveshare-s3-geek --> 🧪 Untested |
+| **[Adafruit QT Py ESP32-S3 (2MB PSRAM)](https://www.amazon.com/s?k=Adafruit+QT+Py+ESP32-S3)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:qtpy-s3-psram --> 🧪 Untested |
+| **[ESP32-S3-DevKitC-1 (N8R8 / N16R8)](https://www.amazon.com/s?k=ESP32-S3-DevKitC-1+N8R8)** | `WROOM-1` · 8/16 MB Flash · **8 MB OPI PSRAM** | Port labeled **`USB`** *(not UART)* | `stadiacast-esp32` *(Default 8MB OPI)* | <!-- board:devkitc-s3-n8r8 --> 🧪 Untested |
+| **[ESP32-S3-DevKitC-1 (N8R2)](https://www.amazon.com/s?k=ESP32-S3-DevKitC-1+N8R2)** | `WROOM-1` · 8 MB Flash · **2 MB Quad PSRAM** | Port labeled **`USB`** *(not UART)* | `stadiacast-esp32-s3-quad` | <!-- board:devkitc-s3-n8r2 --> 🧪 Untested |
+| **[LilyGO T-Dongle-S3 (USB-A Stick)](https://www.amazon.com/s?k=LILYGO+T-Dongle-S3+ESP32-S3)** | `ESP32-S3` · 16 MB Flash · **No PSRAM** *(or 8MB OPI on Plus)* | Built-in USB-A | `stadiacast-esp32-s3-nopsram` | <!-- board:lilygo-tdongle-s3 --> 🧪 Untested |
+| **[M5Stack AtomS3U (USB-A Stick)](https://www.amazon.com/s?k=M5Stack+AtomS3U+ESP32-S3)** | `S3FN8` · 8 MB Flash · **No PSRAM** | Built-in USB-A | `stadiacast-esp32-s3-nopsram` | <!-- board:m5stack-atoms3u --> 🧪 Untested |
+| **[M5Stack StampS3](https://www.amazon.com/s?k=M5Stack+StampS3+ESP32-S3)** | `S3FN8` · 8 MB Flash · **No PSRAM** | USB-C | `stadiacast-esp32-s3-nopsram` | <!-- board:m5stack-stamps3 --> 🧪 Untested |
+
+> **Tested one of the `🧪 Untested` boards?** Open an issue or PR (or maintainers can run `./tools/set_board_status.sh <board-id> tested`) to mark it verified!
+>
+> *(Note: `ESP32-C3`, `ESP32-C5`, `ESP32-C6`, `ESP32-H2`, and original `ESP32` chips do **not** have a programmable USB-OTG peripheral and cannot run this firmware.)*
+
+### Controller Requirements
 - **Google Stadia Controller** running its **Wi-Fi firmware** *(controllers previously switched to Bluetooth mode can be flashed back to Wi-Fi firmware using community flasher tools; this dongle itself never flashes the controller)*
-  - SoftAP SSID: `STADIA_ESP32`
-  - SoftAP Password: `stadiacast`
+  - Default SoftAP SSID: `STADIA_ESP32`
+  - Default SoftAP Password: `stadiacast`
 
 ---
 

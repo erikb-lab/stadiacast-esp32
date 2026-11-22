@@ -224,7 +224,7 @@
         </div>
         <div class="stat">
           <div class="stat-k">Target Board</div>
-          <div class="stat-v">XIAO ESP32-S3</div>
+          <div class="stat-v" id="fw-board">XIAO ESP32-S3 (8MB OPI)</div>
         </div>
         <div class="stat">
           <div class="stat-k">Commit</div>
@@ -236,8 +236,19 @@
         </div>
       </div>
 
+      <div style="margin-bottom: 14px;">
+        <label for="board-select" style="display:block;font-size:0.85rem;color:var(--mut);margin-bottom:6px;font-weight:600;">
+          Select Your ESP32-S3 Board Variant:
+        </label>
+        <select id="board-select" style="width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd);background:var(--sub);color:var(--fg);font-size:0.95rem;font-weight:600;">
+          <option value="octal">Seeed XIAO ESP32-S3 / DevKitC-1 N8R8 (8MB Flash + 8MB Octal PSRAM) — ✅ Tested</option>
+          <option value="quad">Waveshare S3-Zero / S3-SuperMini / Lolin S3 Mini / S3-GEEK / QT Py (4MB+ Flash + 2MB Quad PSRAM) — 🧪 Untested</option>
+          <option value="nopsram">LilyGO T-Dongle-S3 / M5Stack AtomS3U / StampS3 (4MB+ Flash, No PSRAM) — 🧪 Untested</option>
+        </select>
+      </div>
+
       <div class="actions">
-        <esp-web-install-button manifest="./manifest.json">
+        <esp-web-install-button id="esp-install-btn" manifest="./manifest.json">
           <button type="button" slot="activate" class="btn btn-primary">Connect &amp; Install Firmware</button>
           <span slot="unsupported" class="warn-box">
             WebSerial requires Chrome, Edge, or Brave on desktop. Download the binary below to flash via <code>esptool</code> instead.
@@ -247,10 +258,10 @@
           </span>
         </esp-web-install-button>
 
-        <a class="btn btn-secondary" href="./firmware/stadiacast-esp32.bin" download>
+        <a id="dl-ota" class="btn btn-secondary" href="./firmware/stadiacast-esp32.bin" download>
           Download OTA .bin
         </a>
-        <a class="btn btn-secondary" href="./firmware/stadiacast-esp32-merged.bin" download>
+        <a id="dl-merged" class="btn btn-secondary" href="./firmware/stadiacast-esp32-merged.bin" download>
           Download Merged .bin
         </a>
         <a class="btn btn-secondary" href="https://github.com/erikb-lab/stadiacast-esp32/actions/workflows/build-and-pages.yml" target="_blank" rel="noopener">
@@ -359,6 +370,88 @@
         </tbody>
       </table>
     </section>
+
+    <section class="card" aria-labelledby="boards-heading">
+      <h2 id="boards-heading">Supported ESP32-S3 Boards</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Board (Amazon Link)</th>
+            <th>Specs</th>
+            <th>Firmware Variant</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=Seeed+Studio+XIAO+ESP32-S3" target="_blank" rel="noopener"><strong>Seeed Studio XIAO ESP32-S3</strong></a></td>
+            <td>8 MB Flash · 8 MB OPI PSRAM</td>
+            <td><code>8MB OPI (Default)</code></td>
+            <td><!-- board:xiao-s3 -->✅ Tested &amp; Working</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=Waveshare+ESP32-S3-Zero" target="_blank" rel="noopener"><strong>Waveshare ESP32-S3-Zero</strong></a></td>
+            <td>4 MB Flash · 2 MB Quad PSRAM</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:waveshare-s3-zero -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=ESP32-S3+SuperMini+Development+Board" target="_blank" rel="noopener"><strong>ESP32-S3 SuperMini / ProMini</strong></a></td>
+            <td>4 MB Flash · 2 MB Quad PSRAM</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:s3-supermini -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=Lolin+S3+Mini+ESP32-S3" target="_blank" rel="noopener"><strong>Wemos / Lolin S3 Mini</strong></a></td>
+            <td>4 MB Flash · 2 MB Quad PSRAM</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:lolin-s3-mini -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=Waveshare+ESP32-S3-GEEK" target="_blank" rel="noopener"><strong>Waveshare ESP32-S3-GEEK (USB-A)</strong></a></td>
+            <td>16 MB Flash · 2 MB Quad PSRAM</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:waveshare-s3-geek -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=Adafruit+QT+Py+ESP32-S3" target="_blank" rel="noopener"><strong>Adafruit QT Py ESP32-S3 (2MB PSRAM)</strong></a></td>
+            <td>4 MB Flash · 2 MB Quad PSRAM</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:qtpy-s3-psram -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=ESP32-S3-DevKitC-1+N8R8" target="_blank" rel="noopener"><strong>ESP32-S3-DevKitC-1 (N8R8 / N16R8)</strong></a></td>
+            <td>8/16 MB Flash · 8 MB OPI PSRAM (use <code>USB</code> port)</td>
+            <td><code>8MB OPI (Default)</code></td>
+            <td><!-- board:devkitc-s3-n8r8 -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=ESP32-S3-DevKitC-1+N8R2" target="_blank" rel="noopener"><strong>ESP32-S3-DevKitC-1 (N8R2)</strong></a></td>
+            <td>8 MB Flash · 2 MB Quad PSRAM (use <code>USB</code> port)</td>
+            <td><code>s3-quad</code></td>
+            <td><!-- board:devkitc-s3-n8r2 -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=LILYGO+T-Dongle-S3+ESP32-S3" target="_blank" rel="noopener"><strong>LilyGO T-Dongle-S3 (USB-A)</strong></a></td>
+            <td>16 MB Flash · No PSRAM</td>
+            <td><code>s3-nopsram</code></td>
+            <td><!-- board:lilygo-tdongle-s3 -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=M5Stack+AtomS3U+ESP32-S3" target="_blank" rel="noopener"><strong>M5Stack AtomS3U (USB-A)</strong></a></td>
+            <td>8 MB Flash · No PSRAM</td>
+            <td><code>s3-nopsram</code></td>
+            <td><!-- board:m5stack-atoms3u -->🧪 Untested</td>
+          </tr>
+          <tr>
+            <td><a href="https://www.amazon.com/s?k=M5Stack+StampS3+ESP32-S3" target="_blank" rel="noopener"><strong>M5Stack StampS3</strong></a></td>
+            <td>8 MB Flash · No PSRAM</td>
+            <td><code>s3-nopsram</code></td>
+            <td><!-- board:m5stack-stamps3 -->🧪 Untested</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
   </main>
 
   <footer>
@@ -367,18 +460,51 @@
   </footer>
 
   <script>
+    const VARIANTS = {
+      octal: {
+        label: "XIAO ESP32-S3 (8MB OPI)",
+        manifest: "./manifest.json",
+        ota: "./firmware/stadiacast-esp32.bin",
+        merged: "./firmware/stadiacast-esp32-merged.bin",
+        shaKey: "sha256_merged"
+      },
+      quad: {
+        label: "ESP32-S3 Quad PSRAM (FH4R2/N8R2)",
+        manifest: "./manifest-s3-quad.json",
+        ota: "./firmware/stadiacast-esp32-s3-quad.bin",
+        merged: "./firmware/stadiacast-esp32-s3-quad-merged.bin",
+        shaKey: "sha256_quad_merged"
+      },
+      nopsram: {
+        label: "ESP32-S3 No-PSRAM (FN8/N4)",
+        manifest: "./manifest-s3-nopsram.json",
+        ota: "./firmware/stadiacast-esp32-s3-nopsram.bin",
+        merged: "./firmware/stadiacast-esp32-s3-nopsram-merged.bin",
+        shaKey: "sha256_nopsram_merged"
+      }
+    };
+    let verData = {};
+    function applyVariant(k) {
+      const cfg = VARIANTS[k] || VARIANTS.octal;
+      document.getElementById("fw-board").textContent = cfg.label;
+      document.getElementById("esp-install-btn").setAttribute("manifest", cfg.manifest);
+      document.getElementById("dl-ota").setAttribute("href", cfg.ota);
+      document.getElementById("dl-merged").setAttribute("href", cfg.merged);
+      if (verData[cfg.shaKey]) {
+        document.getElementById("fw-sha256").textContent = "Merged SHA-256: " + verData[cfg.shaKey];
+      }
+    }
+    document.getElementById("board-select").addEventListener("change", (e) => applyVariant(e.target.value));
     (async () => {
       try {
         const r = await fetch("./version.json", { cache: "no-store" });
         if (!r.ok) return;
         const v = await r.json();
+        verData = v;
         document.getElementById("fw-ver").textContent = v.version || "unknown";
         document.getElementById("fw-sha").textContent = (v.sha || "").slice(0, 8) || "unknown";
         document.getElementById("fw-date").textContent = v.built_at || "unknown";
-        if (v.sha256_merged) {
-          document.getElementById("fw-sha256").textContent =
-            "Merged SHA-256: " + v.sha256_merged;
-        }
+        applyVariant(document.getElementById("board-select").value);
       } catch (_) {}
     })();
   </script>
