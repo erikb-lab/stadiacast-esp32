@@ -6,10 +6,13 @@ UDP 50000 & 50002, and Core-1 event-driven full-duplex 48 kHz Opus audio) and
 exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
 (composite Gamepad + Bidirectional USB Audio Headset):
 
-- **Dual USB Gamepad Modes (1000 Hz + Rumble, switchable live from the controller)**:
-  - **Stadia HID Mode (`18d1:9400`, default — `Stadia Wireless Adapter`):** Native Google Stadia Controller ID with all 17 buttons (including Assistant & Capture) and Report 5 rumble (`hid-google-stadiaff` on Linux, Steam Input, SDL2/SDL3, macOS, Android).
-  - **XInput Mode (`1209:9401` — `Stadia Wireless Adapter XInput`):** Xbox 360 XInput controller (`0xFF/0x5D/0x01` + MS OS 2.0 `XUSB10`) with native plug-and-play support & rumble on Windows (`xusb22.sys`) and Linux (`xpad`).
-- **Bidirectional USB Audio (UAC1) in Both Modes**:
+- **5 USB Controller Modes (Switchable Live via Controller Hotkey or Web UI)**:
+  - **Stadia HID Mode (`18d1:9400`, default — `Stadia Wireless Adapter` + UAC1 Audio):** Native Google Stadia Controller ID with all 17 buttons (including Assistant & Capture), Report 5 rumble (`hid-google-stadiaff`), and Report 4 OS battery gauge (`0–100%`).
+  - **XInput Mode (`1209:9401` — `Stadia Wireless Adapter XInput` + UAC1 Audio):** Xbox 360 XInput controller (`0xFF/0x5D/0x01` + MS OS 2.0 `XUSB10`) with native plug-and-play support & rumble on Windows (`xusb22.sys`), Linux (`xpad`), and Steam Deck.
+  - **DualShock 4 v2 Mode (`054c:09cc` — `Wireless Controller` + UAC1 Audio):** Emulates a Sony DualShock 4 (`CUH-ZCT2x`) with PlayStation button prompts, rumble, live battery + 3.5 mm jack status, Capture mapped to Touchpad Click, and bidirectional 48 kHz UAC1 headset audio (works on PC, Steam, Linux `hid-playstation`, macOS, Android, PS Remote Play, and PS4 up to Sony's 8-minute auth check).
+  - **Nintendo Switch Pro Controller Mode (`057e:2009` — `Pro Controller`, HID-only):** Full Switch Pro USB handshake (`0x80`/`0x81` + virtual SPI calibration ROM), HD Rumble decoded down to Stadia's L/R motors, live battery level, and physical Nintendo face-button layout (`A↔B`, `X↔Y`) for real Nintendo Switch docks (enable *System Settings → Controllers and Sensors → Pro Controller Wired Communication*) as well as PC / Linux `hid-nintendo`.
+  - **PS3 / DualShock 3 Mode (`054c:0268` — `PLAYSTATION(R)3 Controller`, HID-only):** Authentic 148-byte DualShock 3 / SIXAXIS USB HID descriptor with `0xF2`/`0xF4` operational handshake, working PS/Home button, analog triggers, rumble, and battery reporting for real PS3 consoles, RPCS3, and Linux `hid-sony`.
+- **Bidirectional USB Audio (UAC1) in Stadia HID, XInput, and DualShock 4 Modes**:
   - **Headset Output (Speaker):** 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
   - **Headset Input (Mic):** controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
   - **Hardware Mic Mute** & **Configurable Mic Gain** (`1.0x / 1.5x / 2.0x / 2.5x`, saved in NVS)
@@ -29,9 +32,12 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
 | :--- | :--- | :--- |
 | **Switch to Stadia HID (`18d1:9400`)** | Hold **Assistant + Capture + A** (2 s) | 1 long buzz, reboots (~4–5 s reconnect) |
 | **Switch to XInput (`1209:9401`)** | Hold **Assistant + Capture + X** (2 s) | 2 long buzzes, reboots (~4–5 s reconnect) |
+| **Switch to DualShock 4 (`054c:09cc`)** | Hold **Assistant + Capture + L1** (2 s) | 2 long buzzes, reboots (~4–5 s reconnect) |
+| **Switch to Switch Pro (`057e:2009`)** | Hold **Assistant + Capture + R1** (2 s) | 3 long buzzes, reboots (~4–5 s reconnect) |
+| **Switch to PS3 / DS3 (`054c:0268`)** | Hold **Assistant + Capture + Options (`...`)** (2 s) | 4 long buzzes, reboots (~4–5 s reconnect) |
 | **Home Wi-Fi / LAN Auto-OTA** | Hold **Assistant + Capture + B** (2 s) | 3 buzzes, downloads latest release & reboots |
 | **USB Serial / Flash Mode** | Hold **Assistant + Capture + Y** (2 s) | 4 buzzes, reboots to USB-Serial/JTAG |
-| **Toggle Mic Mute** | Tap **Assistant** *(XInput)* or **Assistant + Capture** *(both modes)* | 1 short buzz = muted, 2 quick taps = unmuted |
+| **Toggle Mic Mute** | Tap **Assistant** *(XInput/DS4)* or **Assistant + Capture** *(any mode)* | 1 short buzz = muted, 2 quick taps = unmuted |
 | **Mic Gain Up / Down** | Hold **Assistant + Capture** + tap **D-Pad Up / Down** | 1–4 quick taps (`1.0x / 1.5x / 2.0x / 2.5x`) |
 | **Cycle Stick Deadzone** | Hold **Assistant + Capture** + tap **D-Pad Right** | 1–3 quick taps (`0% / 4% / 8%`) |
 | **Check Battery Level** | Hold **Assistant + Capture** + tap **D-Pad Left** | 1–4 quick taps (`≤25% / 26–50% / 51–75% / 76–100%`; soft tap if gauge pending) |
@@ -69,7 +75,7 @@ Open the **[Stadia Wireless Adapter Web Flasher](https://erikb-lab.github.io/sta
 
 ### Manual Download (`esptool` CLI)
 
-Download `stadiacast-esp32-v1.5.1-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
+Download `stadiacast-esp32-v1.6.0-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -86,7 +92,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.5.1-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.6.0-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -106,7 +112,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.5.1-merged.bin
+  0x0 stadiacast-esp32-v1.6.0-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -125,7 +131,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.5.1-merged.bin
+  0x0 stadiacast-esp32-v1.6.0-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -142,7 +148,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.5.1-merged.bin
+  0x0 stadiacast-esp32-v1.6.0-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:

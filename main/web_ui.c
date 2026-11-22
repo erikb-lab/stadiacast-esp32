@@ -73,7 +73,12 @@ static const char k_index_html[] =
 "</div><div id=otaMsg class=msg></div></div>"
 
 "<div class=card><h2>Gamepad &amp; Audio</h2>"
-"<div class=row><label>USB Mode</label><select id=selMode><option value=0>Stadia HID (18d1:9400)</option><option value=1>XInput (1209:9401)</option></select>"
+"<div class=row><label>USB Mode</label><select id=selMode>"
+"<option value=0>Stadia HID (18d1:9400 + Audio)</option>"
+"<option value=1>XInput / Xbox 360 (1209:9401 + Audio)</option>"
+"<option value=2>DualShock 4 v2 (054c:09cc + Audio)</option>"
+"<option value=3>Switch Pro (057e:2009, HID-only)</option>"
+"<option value=4>PS3 / DualShock 3 (054c:0268, HID-only)</option></select>"
 "<button onclick='saveMode()'>Switch &amp; Reboot</button></div>"
 "<div class=row><label>Microphone</label><button id=btnMute class=sec onclick='toggleMute()'>Toggle Mute</button></div>"
 "<div class=row><label>Mic Gain</label><select id=selGain onchange='postSet({mic_gain_q8:+this.value})'>"
@@ -127,7 +132,8 @@ static const char k_index_html[] =
 "document.getElementById('slot').textContent=d.slot;"
 "const c=document.getElementById('conn');c.textContent=d.ready?'Controller Connected':'Waiting for Controller';c.className='pill '+(d.ready?'ok':'wait');"
 "document.getElementById('batt').textContent=d.battery_pct>=0?d.battery_pct+'%':'Waiting...';"
-"document.getElementById('mode').textContent=d.usb_mode?'XInput':'Stadia HID';"
+"const MODES=['Stadia HID','XInput','DualShock 4','Switch Pro','PS3 (DS3)'];"
+"document.getElementById('mode').textContent=MODES[d.usb_mode]||'Unknown';"
 "document.getElementById('hs').textContent=d.ready?(d.headset?'Plugged In':'Built-in Mic'):'--';"
 "curMute=!!d.mic_muted;document.getElementById('mic').textContent=curMute?'Muted':'Live';"
 "document.getElementById('btnMute').textContent=curMute?'Unmute Mic':'Mute Mic';"
@@ -264,10 +270,16 @@ static esp_err_t post_api_settings(httpd_req_t *req) {
         msg = cJSON_IsTrue(it) ? "BLE auto-provisioning enabled" : "BLE auto-provisioning disabled";
     }
     if ((it = cJSON_GetObjectItem(j, "usb_mode")) && cJSON_IsNumber(it)) {
-        usb_gamepad_mode_t m = (it->valueint == 1) ? USB_GAMEPAD_MODE_XINPUT : USB_GAMEPAD_MODE_STADIA_HID;
+        if (it->valueint < 0 || it->valueint >= (int)USB_GAMEPAD_MODE_COUNT) {
+            cJSON_Delete(j);
+            return send_json(req, "400 Bad Request", "{\"ok\":false,\"msg\":\"Invalid USB mode\"}");
+        }
+        usb_gamepad_mode_t m = (usb_gamepad_mode_t)it->valueint;
         usb_gamepad_save_mode(m);
         need_reboot = true;
-        msg = (m == USB_GAMEPAD_MODE_XINPUT) ? "Switching to XInput, rebooting..." : "Switching to Stadia HID, rebooting...";
+        static char s_mode_msg[64];
+        snprintf(s_mode_msg, sizeof(s_mode_msg), "Switching to %s, rebooting...", usb_gamepad_mode_name(m));
+        msg = s_mode_msg;
     }
     if ((it = cJSON_GetObjectItem(j, "ap_reset")) && cJSON_IsTrue(it)) {
         wifi_ap_save_credentials("", "");

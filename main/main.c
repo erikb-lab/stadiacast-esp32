@@ -98,11 +98,12 @@ void app_main(void) {
     net_services_init();
     https_boot_init();
     usb_gamepad_init(stadia_transport_set_rumble);
+
+    /* Confirm OTA image is healthy once Wi-Fi SoftAP, Web UI/OTA, and USB are up */
+    (void)esp_ota_mark_app_valid_cancel_rollback();
+
     stadia_transport_init();
     ble_provision_init();
-
-    /* Confirm OTA image is healthy so bootloader cancels automatic rollback */
-    (void)esp_ota_mark_app_valid_cancel_rollback();
 
     size_t int_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);

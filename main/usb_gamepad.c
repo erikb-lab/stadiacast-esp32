@@ -15,6 +15,7 @@
 #include "class/hid/hid_device.h"
 #include "device/usbd_pvt.h"
 #include "usb_audio.h"
+#include "usb_modes_extra.h"
 
 #define TAG "USB-STADIA"
 
@@ -28,58 +29,11 @@
 #define RUMBLE_REPORT_ID    5
 #define TRIGGER_THRESHOLD   30
 
-#define UAC1_IAD_DESC_LEN 8
-#define UAC1_AUDIO_DESC_LEN ( \
-    UAC1_IAD_DESC_LEN + \
-    TUD_AUDIO10_DESC_STD_AC_LEN + \
-    TUD_AUDIO10_DESC_CS_AC_LEN(2) + \
-    TUD_AUDIO10_DESC_INPUT_TERM_LEN + \
-    TUD_AUDIO10_DESC_OUTPUT_TERM_LEN + \
-    TUD_AUDIO10_DESC_INPUT_TERM_LEN + \
-    TUD_AUDIO10_DESC_OUTPUT_TERM_LEN + \
-    TUD_AUDIO10_DESC_STD_AS_LEN + \
-    TUD_AUDIO10_DESC_STD_AS_LEN + \
-    TUD_AUDIO10_DESC_CS_AS_INT_LEN + \
-    TUD_AUDIO10_DESC_TYPE_I_FORMAT_LEN(1) + \
-    TUD_AUDIO10_DESC_STD_AS_ISO_EP_LEN + \
-    TUD_AUDIO10_DESC_CS_AS_ISO_EP_LEN + \
-    TUD_AUDIO10_DESC_STD_AS_LEN + \
-    TUD_AUDIO10_DESC_STD_AS_LEN + \
-    TUD_AUDIO10_DESC_CS_AS_INT_LEN + \
-    TUD_AUDIO10_DESC_TYPE_I_FORMAT_LEN(1) + \
-    TUD_AUDIO10_DESC_STD_AS_ISO_EP_LEN + \
-    TUD_AUDIO10_DESC_CS_AS_ISO_EP_LEN )
-
 #define XINPUT_DESC_LEN     (9 + 17 + 7 + 7)
 #define HID_DESC_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + TUD_HID_INOUT_DESC_LEN + UAC1_AUDIO_DESC_LEN)
 #define XIN_DESC_TOTAL_LEN  (TUD_CONFIG_DESC_LEN + XINPUT_DESC_LEN + UAC1_AUDIO_DESC_LEN)
 
-#define UAC1_AUDIO_DESC_BODY \
-    /* ITF 1..3: IAD + UAC1 Full-Duplex Audio (SPK EP 0x02 OUT 192B ADAPTIVE, MIC EP 0x83 IN 96B ASYNC) */ \
-    0x08, TUSB_DESC_INTERFACE_ASSOCIATION, USB_ITF_AUDIO_CONTROL, 0x03, TUSB_CLASS_AUDIO, 0x00, 0x00, 0x00, \
-    TUD_AUDIO10_DESC_STD_AC(USB_ITF_AUDIO_CONTROL, 0x00, 0x00), \
-    TUD_AUDIO10_DESC_CS_AC( \
-        0x0100, \
-        (TUD_AUDIO10_DESC_INPUT_TERM_LEN + TUD_AUDIO10_DESC_OUTPUT_TERM_LEN + TUD_AUDIO10_DESC_INPUT_TERM_LEN + TUD_AUDIO10_DESC_OUTPUT_TERM_LEN), \
-        USB_ITF_AUDIO_STREAMING_SPK, USB_ITF_AUDIO_STREAMING_MIC), \
-    TUD_AUDIO10_DESC_INPUT_TERM(USB_UAC1_SPK_IT_ID, AUDIO_TERM_TYPE_USB_STREAMING, 0x00, 0x02, 0x0003, 0x00, 0x00), \
-    TUD_AUDIO10_DESC_OUTPUT_TERM(USB_UAC1_SPK_OT_ID, AUDIO_TERM_TYPE_OUT_HEADPHONES, 0x00, USB_UAC1_SPK_IT_ID, 0x00), \
-    TUD_AUDIO10_DESC_INPUT_TERM(USB_UAC1_MIC_IT_ID, AUDIO_TERM_TYPE_IN_GENERIC_MIC, 0x00, 0x01, 0x0001, 0x00, 0x00), \
-    TUD_AUDIO10_DESC_OUTPUT_TERM(USB_UAC1_MIC_OT_ID, AUDIO_TERM_TYPE_USB_STREAMING, 0x00, USB_UAC1_MIC_IT_ID, 0x00), \
-    /* ITF 2: Speaker OUT (48kHz, 16-bit stereo, Adaptive - required so TinyUSB 0.21 classifies as data EP) */ \
-    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_SPK, 0x00, 0x00, 0x00), \
-    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_SPK, 0x01, 0x01, 0x00), \
-    TUD_AUDIO10_DESC_CS_AS_INT(USB_UAC1_SPK_IT_ID, 0x01, AUDIO10_DATA_FORMAT_TYPE_I_PCM), \
-    TUD_AUDIO10_DESC_TYPE_I_FORMAT(2, 2, 16, 48000), \
-    TUD_AUDIO10_DESC_STD_AS_ISO_EP(USB_UAC1_SPK_EP_OUT, (uint8_t)(TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ADAPTIVE), USB_UAC1_SPK_MPS, 0x01, 0x00), \
-    TUD_AUDIO10_DESC_CS_AS_ISO_EP(0x00, AUDIO10_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, 0x0001), \
-    /* ITF 3: Mic IN (48kHz, 16-bit mono, Asynchronous - required so TinyUSB 0.21 classifies as data EP) */ \
-    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_MIC, 0x00, 0x00, 0x00), \
-    TUD_AUDIO10_DESC_STD_AS_INT(USB_ITF_AUDIO_STREAMING_MIC, 0x01, 0x01, 0x00), \
-    TUD_AUDIO10_DESC_CS_AS_INT(USB_UAC1_MIC_OT_ID, 0x01, AUDIO10_DATA_FORMAT_TYPE_I_PCM), \
-    TUD_AUDIO10_DESC_TYPE_I_FORMAT(1, 2, 16, 48000), \
-    TUD_AUDIO10_DESC_STD_AS_ISO_EP(USB_UAC1_MIC_EP_IN, (uint8_t)(TUSB_XFER_ISOCHRONOUS | TUSB_ISO_EP_ATT_ASYNCHRONOUS), USB_UAC1_MIC_MPS, 0x01, 0x00), \
-    TUD_AUDIO10_DESC_CS_AS_ISO_EP(0x00, AUDIO10_CS_AS_ISO_DATA_EP_LOCK_DELAY_UNIT_MILLISEC, 0x0001)
+#define UAC1_AUDIO_DESC_BODY UAC1_AUDIO_DESC_BODY_AT(USB_ITF_AUDIO_CONTROL, USB_ITF_AUDIO_STREAMING_SPK, USB_ITF_AUDIO_STREAMING_MIC)
 
 typedef struct __attribute__((packed)) {
     uint8_t hat;
@@ -233,10 +187,12 @@ static uint16_t s_stick_deadzone = 0; /* 0..8192 (0=raw, 1310=4%, 2621=8%) */
 static portMUX_TYPE s_hid_mux = portMUX_INITIALIZER_UNLOCKED;
 static stadia_hid_report_t s_latest_hid = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
 static xinput_report_t s_latest_xin = { .report_id = 0x00, .report_size = 0x14 };
+static usb_canonical_input_t s_latest_canon = { .battery_pct = 100 };
 static bool s_dirty = false;
 static bool s_batt_dirty = false;
 static uint8_t s_battery_pct = 100; /* Last known 0..100% (persisted in NVS so UPower coldplug succeeds) */
 static int8_t  s_saved_batt_pct = -1;
+static bool    s_headset_plugged = false;
 static bool s_kick_pending = false;
 static int64_t s_last_tx_us = 0;
 static usb_rumble_cb_t s_rumble_cb = NULL;
@@ -354,17 +310,21 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     return false;
 }
 
-/* ---------------- Core-1 TX Marshaling (HID + XInput) ---------------- */
+/* ---------------- Core-1 TX Marshaling (HID + XInput + Extra Modes) ---------------- */
 static void hid_flush_on_tusb_task(void *arg) {
     (void)arg;
     stadia_hid_report_t hid_rep;
     xinput_report_t xin_rep;
+    usb_canonical_input_t canon;
     bool should_send = false;
     bool send_batt = false;
     uint8_t batt_pct = 100;
 
     portENTER_CRITICAL(&s_hid_mux);
     s_kick_pending = false;
+    canon = s_latest_canon;
+    canon.battery_pct = s_battery_pct;
+    canon.headset_plugged = s_headset_plugged;
     if (s_dirty) {
         hid_rep = s_latest_hid;
         xin_rep = s_latest_xin;
@@ -376,6 +336,25 @@ static void hid_flush_on_tusb_task(void *arg) {
         send_batt = true;
     }
     portEXIT_CRITICAL(&s_hid_mux);
+
+    if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+        bool sent_input = false;
+        if (usb_modes_extra_flush_tx(s_mode, &canon, should_send, &sent_input)) {
+            if (sent_input) {
+                s_last_tx_us = esp_timer_get_time();
+            } else if (should_send) {
+                /* Sent a priority handshake/subcmd reply; keep input dirty for completion cb */
+                portENTER_CRITICAL(&s_hid_mux);
+                s_dirty = true;
+                portEXIT_CRITICAL(&s_hid_mux);
+            }
+        } else if (should_send) {
+            portENTER_CRITICAL(&s_hid_mux);
+            s_dirty = true;
+            portEXIT_CRITICAL(&s_hid_mux);
+        }
+        return;
+    }
 
     if (should_send) {
         if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
@@ -411,16 +390,30 @@ static void hid_flush_on_tusb_task(void *arg) {
     }
 }
 
-/* ---------------- TinyUSB HID Callbacks (Stadia HID mode) ---------------- */
+/* ---------------- TinyUSB HID Callbacks (All HID Modes) ---------------- */
 uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
     (void)instance;
+    if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+        const uint8_t *rd = usb_modes_extra_get_report_desc(s_mode);
+        if (rd) return rd;
+    }
     return s_hid_report_desc;
 }
 
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen) {
-    (void)instance; (void)report_type;
+    (void)instance;
+    if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+        usb_canonical_input_t canon;
+        portENTER_CRITICAL(&s_hid_mux);
+        canon = s_latest_canon;
+        canon.battery_pct = s_battery_pct;
+        canon.headset_plugged = s_headset_plugged;
+        portEXIT_CRITICAL(&s_hid_mux);
+        return usb_modes_extra_get_report(s_mode, report_id, report_type, buffer, reqlen, &canon);
+    }
+    (void)report_type;
     if (report_id == INPUT_REPORT_ID && reqlen >= sizeof(s_latest_hid)) {
         portENTER_CRITICAL(&s_hid_mux);
         memcpy(buffer, &s_latest_hid, sizeof(s_latest_hid));
@@ -440,7 +433,22 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance; (void)report_type;
+    (void)instance;
+    if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+        usb_canonical_input_t canon;
+        portENTER_CRITICAL(&s_hid_mux);
+        canon = s_latest_canon;
+        canon.battery_pct = s_battery_pct;
+        canon.headset_plugged = s_headset_plugged;
+        portEXIT_CRITICAL(&s_hid_mux);
+        bool kick = false;
+        usb_modes_extra_set_report(s_mode, report_id, report_type, buffer, bufsize, &canon, &kick);
+        if (kick) {
+            hid_flush_on_tusb_task(NULL);
+        }
+        return;
+    }
+    (void)report_type;
     if (!s_rumble_cb || !buffer) return;
     uint16_t left = 0, right = 0;
     if (report_id == RUMBLE_REPORT_ID && bufsize >= 4) {
@@ -510,12 +518,14 @@ static uint8_t dpad_to_hat(uint32_t b) {
     return 8;
 }
 
-static void push_reports(const stadia_hid_report_t *hid, const xinput_report_t *xin) {
+static void push_reports(const stadia_hid_report_t *hid, const xinput_report_t *xin,
+                         const usb_canonical_input_t *canon) {
     if (!s_usb_installed) return;
     bool kick = false;
     portENTER_CRITICAL(&s_hid_mux);
     s_latest_hid = *hid;
     s_latest_xin = *xin;
+    s_latest_canon = *canon;
     s_dirty = true;
     if (!s_kick_pending) {
         s_kick_pending = true;
@@ -594,19 +604,33 @@ void usb_gamepad_send(uint32_t b,
         .ry          = clamp_i16(ry),
     };
 
-    push_reports(&hid, &xin);
+    usb_canonical_input_t canon = {
+        .buttons = b,
+        .lx      = lx,
+        .ly      = ly,
+        .rx      = rx,
+        .ry      = ry,
+        .lt      = lt8,
+        .rt      = rt8,
+    };
+
+    push_reports(&hid, &xin, &canon);
 }
 
 void usb_gamepad_reset(void) {
     stadia_hid_report_t hid_neutral = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
     xinput_report_t xin_neutral = { .report_id = 0x00, .report_size = 0x14 };
-    push_reports(&hid_neutral, &xin_neutral);
+    usb_canonical_input_t canon_neutral = { 0 };
+    push_reports(&hid_neutral, &xin_neutral, &canon_neutral);
 }
 
 void usb_gamepad_keepalive_tick(void) {
     if (!s_usb_installed) return;
     int64_t now = esp_timer_get_time();
-    if ((now - s_last_tx_us) >= 100000) {
+    int64_t interval_us = (s_mode >= USB_GAMEPAD_MODE_DS4)
+                          ? usb_modes_extra_keepalive_us(s_mode)
+                          : 100000;
+    if ((now - s_last_tx_us) >= interval_us) {
         bool kick = false;
         portENTER_CRITICAL(&s_hid_mux);
         s_dirty = true;
@@ -629,8 +653,8 @@ static usb_gamepad_mode_t load_mode_from_nvs(void) {
         (void)nvs_get_u8(h, NVS_KEY_USB_MODE, &val);
         nvs_close(h);
     }
-    return (val == (uint8_t)USB_GAMEPAD_MODE_XINPUT)
-           ? USB_GAMEPAD_MODE_XINPUT
+    return (val < (uint8_t)USB_GAMEPAD_MODE_COUNT)
+           ? (usb_gamepad_mode_t)val
            : USB_GAMEPAD_MODE_STADIA_HID;
 }
 
@@ -638,7 +662,25 @@ usb_gamepad_mode_t usb_gamepad_get_mode(void) {
     return s_mode;
 }
 
+const char *usb_gamepad_mode_name(usb_gamepad_mode_t mode) {
+    switch (mode) {
+    case USB_GAMEPAD_MODE_STADIA_HID: return "Stadia HID";
+    case USB_GAMEPAD_MODE_XINPUT:     return "XInput";
+    case USB_GAMEPAD_MODE_DS4:        return "DualShock 4";
+    case USB_GAMEPAD_MODE_SWITCH_PRO: return "Switch Pro";
+    case USB_GAMEPAD_MODE_PS3:        return "PS3 (DS3)";
+    default:                          return "Unknown";
+    }
+}
+
+bool usb_gamepad_mode_has_audio(usb_gamepad_mode_t mode) {
+    return (mode == USB_GAMEPAD_MODE_STADIA_HID ||
+            mode == USB_GAMEPAD_MODE_XINPUT ||
+            mode == USB_GAMEPAD_MODE_DS4);
+}
+
 bool usb_gamepad_save_mode(usb_gamepad_mode_t mode) {
+    if ((unsigned)mode >= (unsigned)USB_GAMEPAD_MODE_COUNT) return false;
     nvs_handle_t h;
     if (nvs_open(NVS_NS_USB, NVS_READWRITE, &h) != ESP_OK) return false;
     esp_err_t err = nvs_set_u8(h, NVS_KEY_USB_MODE, (uint8_t)mode);
@@ -669,11 +711,19 @@ void usb_gamepad_set_battery(int pct) {
     bool kick = false;
     portENTER_CRITICAL(&s_hid_mux);
     s_battery_pct = val;
-    if (s_usb_installed && s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
-        s_batt_dirty = true;
-        if (!s_kick_pending) {
-            s_kick_pending = true;
-            kick = true;
+    if (s_usb_installed) {
+        if (s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
+            s_batt_dirty = true;
+            if (!s_kick_pending) {
+                s_kick_pending = true;
+                kick = true;
+            }
+        } else if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+            s_dirty = true;
+            if (!s_kick_pending) {
+                s_kick_pending = true;
+                kick = true;
+            }
         }
     }
     portEXIT_CRITICAL(&s_hid_mux);
@@ -689,6 +739,25 @@ void usb_gamepad_set_battery(int pct) {
             }
             nvs_close(h);
         }
+    }
+}
+
+void usb_gamepad_set_headset(bool plugged) {
+    bool kick = false;
+    portENTER_CRITICAL(&s_hid_mux);
+    if (s_headset_plugged != plugged) {
+        s_headset_plugged = plugged;
+        if (s_usb_installed && s_mode == USB_GAMEPAD_MODE_DS4) {
+            s_dirty = true;
+            if (!s_kick_pending) {
+                s_kick_pending = true;
+                kick = true;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&s_hid_mux);
+    if (kick) {
+        usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
     }
 }
 
@@ -724,23 +793,31 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
         }
         if (saved_dz <= 8192u) s_stick_deadzone = saved_dz;
     }
+
+    usb_modes_extra_init(s_mode, rumble_cb);
     usb_audio_init();
 
-    const tinyusb_config_t tusb_cfg = (s_mode == USB_GAMEPAD_MODE_XINPUT)
-        ? (tinyusb_config_t){
+    tinyusb_config_t tusb_cfg;
+    if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
+        tusb_cfg = (tinyusb_config_t){
             .device_descriptor        = &s_xinput_device_desc,
             .string_descriptor        = s_xinput_string_desc,
             .string_descriptor_count  = sizeof(s_xinput_string_desc) / sizeof(s_xinput_string_desc[0]),
             .external_phy             = false,
             .configuration_descriptor = s_xinput_config_desc,
-        }
-        : (tinyusb_config_t){
+        };
+    } else if (s_mode >= USB_GAMEPAD_MODE_DS4 && usb_modes_extra_get_tusb_cfg(s_mode, &tusb_cfg)) {
+        /* Configured by usb_modes_extra */
+    } else {
+        s_mode = USB_GAMEPAD_MODE_STADIA_HID;
+        tusb_cfg = (tinyusb_config_t){
             .device_descriptor        = &s_hid_device_desc,
             .string_descriptor        = s_hid_string_desc,
             .string_descriptor_count  = sizeof(s_hid_string_desc) / sizeof(s_hid_string_desc[0]),
             .external_phy             = false,
             .configuration_descriptor = s_hid_config_desc,
         };
+    }
 
     esp_err_t err = tinyusb_driver_install(&tusb_cfg);
     if (err != ESP_OK) {
@@ -748,6 +825,7 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
         return;
     }
     s_usb_installed = true;
-    ESP_LOGI(TAG, "USB mode=%s + UAC1 audio ready at 1000 Hz",
-             (s_mode == USB_GAMEPAD_MODE_XINPUT) ? "XInput (1209:9401)" : "Stadia HID (18d1:9400)");
+    ESP_LOGI(TAG, "USB mode=%s (%s) ready",
+             usb_gamepad_mode_name(s_mode),
+             usb_gamepad_mode_has_audio(s_mode) ? "+ UAC1 audio" : "HID-only");
 }

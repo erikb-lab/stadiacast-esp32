@@ -960,6 +960,7 @@ static void handle_disp_rpc_notification(const uint8_t *payload, size_t len) {
             uint32_t m = ctd->variant.audio_configuration_changed.mode;
             if (m == 0 || m == 1) {
                 g_headset_plugged = (m == 1);
+                usb_gamepad_set_headset(g_headset_plugged);
                 ESP_LOGI(TAG, "3.5mm headset %s", g_headset_plugged ? "PLUGGED IN" : "UNPLUGGED");
             }
         }
@@ -975,7 +976,10 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
     if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd) &&
         ctd->which_variant == gotham_display_ControllerToDisplay_controller_state_tag) {
         const gotham_display_GetControllerStateResponse *cs = &ctd->variant.controller_state;
-        if (cs->has_f4) g_headset_plugged = cs->f4;
+        if (cs->has_f4) {
+            g_headset_plugged = cs->f4;
+            usb_gamepad_set_headset(g_headset_plugged);
+        }
         if (cs->has_f10) {
             float f10_val = 0.0f;
             memcpy(&f10_val, &cs->f10, sizeof(f10_val));
@@ -1255,6 +1259,7 @@ static void pump_dtls(dtls_link_t *L) {
             g_batt_warn_15 = false;
             g_batt_warn_5 = false;
             g_headset_plugged = false;
+            usb_gamepad_set_headset(false);
             usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             link_reset(&g_game);
@@ -1424,6 +1429,7 @@ static void stadia_transport_task(void *arg) {
             g_batt_warn_15 = false;
             g_batt_warn_5 = false;
             g_headset_plugged = false;
+            usb_gamepad_set_headset(false);
             usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             snprintf(g_disp.ctrl_ufrag, sizeof(g_disp.ctrl_ufrag), "%s", g_pending_ufrag);
@@ -1488,11 +1494,14 @@ static void stadia_transport_task(void *arg) {
         }
 
         /* Controller hotkeys & mode switching:
-         *   Hold 2s: Assistant + Capture + A -> Stadia HID (1 buzz, fast deauth reboot)
-         *   Hold 2s: Assistant + Capture + X -> XInput     (2 buzzes, fast deauth reboot)
-         *   Hold 2s: Assistant + Capture + B -> Home Wi-Fi / LAN Auto-OTA (3 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + Y -> USB ROM Bootloader Mode   (4 buzzes, reboot)
-         *   Tap:     Assistant (XInput mode) OR Assistant + Capture (any mode) -> Mic mute toggle
+         *   Hold 2s: Assistant + Capture + A       -> Stadia HID    (1 buzz, reboot)
+         *   Hold 2s: Assistant + Capture + X       -> XInput        (2 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + L1      -> DualShock 4   (2 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + R1      -> Switch Pro    (3 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + Options -> PS3 (DS3)     (4 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + B       -> Home Wi-Fi / LAN Auto-OTA (3 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + Y       -> USB ROM Bootloader Mode   (4 buzzes, reboot)
+         *   Tap:     Assistant (XInput/DS4 mode) OR Assistant + Capture (any mode) -> Mic mute toggle
          *   Tap:     Assistant + Capture + D-Pad Up / Down  -> Mic gain 1.0x / 1.5x / 2.0x / 2.5x
          *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8%
          *   Tap:     Assistant + Capture + D-Pad Left       -> Battery check (1-4 buzzes = quartile; soft buzz = unknown) */
@@ -1501,16 +1510,22 @@ static void stadia_transport_task(void *arg) {
             const uint32_t btn_down   = (1u << 1);
             const uint32_t btn_left   = (1u << 2);
             const uint32_t btn_right  = (1u << 3);
+            const uint32_t btn_opt    = (1u << 5);
+            const uint32_t btn_l1     = (1u << 8);
+            const uint32_t btn_r1     = (1u << 9);
             const uint32_t btn_asst   = (1u << 10);
             const uint32_t btn_cap    = (1u << 11);
             const uint32_t btn_a      = (1u << 12);
             const uint32_t btn_b      = (1u << 13);
             const uint32_t btn_x      = (1u << 14);
             const uint32_t btn_y      = (1u << 15);
-            const uint32_t face_mask  = btn_a | btn_b | btn_x | btn_y;
+            const uint32_t hold_mask  = btn_a | btn_b | btn_x | btn_y | btn_l1 | btn_r1 | btn_opt;
             const uint32_t combo_base   = btn_asst | btn_cap;
             const uint32_t combo_stadia = combo_base | btn_a;
             const uint32_t combo_xinput = combo_base | btn_x;
+            const uint32_t combo_ds4    = combo_base | btn_l1;
+            const uint32_t combo_switch = combo_base | btn_r1;
+            const uint32_t combo_ps3    = combo_base | btn_opt;
             const uint32_t combo_ota    = combo_base | btn_b;
             const uint32_t combo_boot   = combo_base | btn_y;
 
@@ -1536,7 +1551,8 @@ static void stadia_transport_task(void *arg) {
                 if (cur & ~(btn_asst | btn_cap)) s_asst_chord_used = true;
             } else if (s_prev_btn & btn_asst) {
                 /* Assistant released: quick tap (<600ms) with no other action button = mic mute toggle */
-                bool allow_mute = s_both_down || (usb_gamepad_get_mode() == USB_GAMEPAD_MODE_XINPUT);
+                usb_gamepad_mode_t cur_mode = usb_gamepad_get_mode();
+                bool allow_mute = s_both_down || (cur_mode == USB_GAMEPAD_MODE_XINPUT || cur_mode == USB_GAMEPAD_MODE_DS4);
                 if (allow_mute && !s_asst_chord_used && (now - s_asst_down_us) < 600000) {
                     bool muted = !usb_audio_is_mic_muted();
                     usb_audio_set_mic_muted(muted);
@@ -1588,11 +1604,14 @@ static void stadia_transport_task(void *arg) {
             /* 2-second hold combos (USB mode switch, Home Wi-Fi Auto-OTA, USB Bootloader) */
             uint32_t matched = 0;
             if ((cur & combo_base) == combo_base) {
-                uint32_t face = cur & face_mask;
-                if (face == btn_a)      matched = combo_stadia;
-                else if (face == btn_x) matched = combo_xinput;
-                else if (face == btn_b) matched = combo_ota;
-                else if (face == btn_y) matched = combo_boot;
+                uint32_t hold = cur & hold_mask;
+                if (hold == btn_a)        matched = combo_stadia;
+                else if (hold == btn_x)   matched = combo_xinput;
+                else if (hold == btn_l1)  matched = combo_ds4;
+                else if (hold == btn_r1)  matched = combo_switch;
+                else if (hold == btn_opt) matched = combo_ps3;
+                else if (hold == btn_b)   matched = combo_ota;
+                else if (hold == btn_y)   matched = combo_boot;
             }
 
             if (matched != 0) {
@@ -1626,12 +1645,14 @@ static void stadia_transport_task(void *arg) {
                         }
                         ota_updater_reboot_clean(true);
                     } else {
-                        usb_gamepad_mode_t target = (matched == combo_xinput)
-                                                    ? USB_GAMEPAD_MODE_XINPUT
-                                                    : USB_GAMEPAD_MODE_STADIA_HID;
-                        int pulses = (target == USB_GAMEPAD_MODE_XINPUT) ? 2 : 1;
+                        usb_gamepad_mode_t target = USB_GAMEPAD_MODE_STADIA_HID;
+                        int pulses = 1;
+                        if (matched == combo_xinput)      { target = USB_GAMEPAD_MODE_XINPUT;     pulses = 2; }
+                        else if (matched == combo_ds4)    { target = USB_GAMEPAD_MODE_DS4;        pulses = 2; }
+                        else if (matched == combo_switch) { target = USB_GAMEPAD_MODE_SWITCH_PRO; pulses = 3; }
+                        else if (matched == combo_ps3)    { target = USB_GAMEPAD_MODE_PS3;        pulses = 4; }
                         ESP_LOGI(TAG, "Mode combo triggered -> switching USB mode to %s",
-                                 (target == USB_GAMEPAD_MODE_XINPUT) ? "XInput" : "Stadia HID");
+                                 usb_gamepad_mode_name(target));
                         (void)usb_gamepad_save_mode(target);
                         for (int p = 0; p < pulses; p++) {
                             if (g_game.handshake_done) send_game_rumble(0xB000, 0xB000);

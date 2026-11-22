@@ -3,6 +3,7 @@
 
 #include <stdatomic.h>
 #include <string.h>
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "class/audio/audio_device.h"
 
@@ -20,7 +21,7 @@ typedef struct {
     atomic_uint_fast32_t drops;
 } spsc_byte_buf_t;
 
-static uint8_t s_spk_mem[SPK_SPSC_CAP] __attribute__((aligned(4)));
+static EXT_RAM_BSS_ATTR uint8_t s_spk_mem[SPK_SPSC_CAP] __attribute__((aligned(4)));
 static spsc_byte_buf_t s_spk_buf = {
     .buf = s_spk_mem,
     .capacity = SPK_SPSC_CAP,
@@ -31,6 +32,8 @@ static spsc_byte_buf_t s_spk_buf = {
 
 static atomic_uint_fast8_t  s_spk_alt = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast8_t  s_mic_alt = ATOMIC_VAR_INIT(0);
+static uint8_t              s_spk_itf = USB_ITF_AUDIO_STREAMING_SPK;
+static uint8_t              s_mic_itf = USB_ITF_AUDIO_STREAMING_MIC;
 static atomic_bool          s_spk_flush = ATOMIC_VAR_INIT(false);
 static atomic_bool          s_mic_primed = ATOMIC_VAR_INIT(false);
 static atomic_bool          s_mic_muted = ATOMIC_VAR_INIT(false);
@@ -135,6 +138,11 @@ static void push_mic_tx_1ms(void) {
     (void)tud_audio_write(pcm, (uint16_t)sizeof(pcm));
 }
 
+void usb_audio_set_interfaces(uint8_t spk_itf, uint8_t mic_itf) {
+    s_spk_itf = spk_itf;
+    s_mic_itf = mic_itf;
+}
+
 void usb_audio_init(void) {
     atomic_store(&s_spk_alt, 0);
     atomic_store(&s_mic_alt, 0);
@@ -191,7 +199,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     uint8_t itf = tu_u16_low(p_request->wIndex);
     uint8_t alt = tu_u16_low(p_request->wValue);
 
-    if (itf == USB_ITF_AUDIO_STREAMING_SPK) {
+    if (itf == s_spk_itf) {
         s_spk_rx_since_notify = 0;
         atomic_store_explicit(&s_spk_alt, alt, memory_order_release);
         if (alt == 0) {
@@ -201,7 +209,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         return true;
     }
 
-    if (itf == USB_ITF_AUDIO_STREAMING_MIC) {
+    if (itf == s_mic_itf) {
         atomic_store_explicit(&s_mic_primed, false, memory_order_release);
         stadia_opus_mic_reset();
         atomic_store_explicit(&s_mic_alt, alt, memory_order_release);
@@ -218,12 +226,12 @@ bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const 
     (void)rhport;
     if (!p_request) return false;
     uint8_t itf = tu_u16_low(p_request->wIndex);
-    if (itf == USB_ITF_AUDIO_STREAMING_SPK) {
+    if (itf == s_spk_itf) {
         s_spk_rx_since_notify = 0;
         atomic_store_explicit(&s_spk_alt, 0, memory_order_release);
         atomic_store_explicit(&s_spk_flush, true, memory_order_release);
         stadia_opus_notify();
-    } else if (itf == USB_ITF_AUDIO_STREAMING_MIC) {
+    } else if (itf == s_mic_itf) {
         atomic_store_explicit(&s_mic_alt, 0, memory_order_release);
         atomic_store_explicit(&s_mic_primed, false, memory_order_release);
     }

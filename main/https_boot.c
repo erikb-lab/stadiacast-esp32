@@ -531,14 +531,13 @@ static void https_boot_task(void *arg) {
 
     /* Start HTTPS on :443 */
     httpd_ssl_config_t httpd_ssl = HTTPD_SSL_CONFIG_DEFAULT();
-    httpd_ssl.httpd.stack_size = 32768;
-    httpd_ssl.httpd.task_priority = 7;
+    httpd_ssl.httpd.stack_size = 20480;
+    httpd_ssl.httpd.task_priority = 6;
     httpd_ssl.httpd.max_uri_handlers = 16;
     httpd_ssl.httpd.max_open_sockets = 10;
     httpd_ssl.httpd.lru_purge_enable = true;
     httpd_ssl.httpd.ctrl_port = 32769; /* Avoid collision with port 80 HTTP ctrl_port (32768) */
     httpd_ssl.port_secure = 443;
-    httpd_ssl.session_tickets = true;  /* Fast TLS 1.2 resumption across controller boot requests */
     httpd_ssl.servercert = (const uint8_t *)fullchain_pem_start;
     httpd_ssl.servercert_len = (size_t)(fullchain_pem_end - fullchain_pem_start);
     httpd_ssl.prvtkey_pem = (const uint8_t *)privkey_pem_start;
