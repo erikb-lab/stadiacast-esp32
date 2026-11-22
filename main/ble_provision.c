@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -67,6 +68,7 @@ static char s_status_str[96] = "Initializing BLE...";
 static volatile bool s_auto_enabled = true;
 static volatile bool s_manual_trigger = false;
 static volatile bool s_ble_synced = false;
+static volatile int64_t s_wifi_pause_until_us = 0;
 
 static SemaphoreHandle_t s_op_sem = NULL;
 static volatile bool     s_found_target = false;
@@ -119,7 +121,16 @@ void ble_provision_set_auto(bool enabled) {
 }
 
 void ble_provision_trigger_now(void) {
+    s_wifi_pause_until_us = 0;
     s_manual_trigger = true;
+}
+
+void ble_provision_pause_for_wifi_ms(uint32_t ms) {
+    int64_t until = esp_timer_get_time() + (int64_t)ms * 1000LL;
+    if (until > s_wifi_pause_until_us) s_wifi_pause_until_us = until;
+    if (s_ble_synced) {
+        (void)ble_gap_disc_cancel();
+    }
 }
 
 static bool str_contains_ci(const uint8_t *hay, size_t hay_len, const char *needle) {
@@ -562,9 +573,9 @@ static void ble_prov_worker_task(void *arg) {
     (void)arg;
     while (!s_ble_synced) vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* Give an already-provisioned controller 4s on boot to connect over Wi-Fi first */
+    /* Give an already-provisioned controller 6s on boot to connect over Wi-Fi first */
     set_status("Ready (waiting for controller)");
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    vTaskDelay(pdMS_TO_TICKS(6000));
 
     for (;;) {
         bool manual = s_manual_trigger;
@@ -573,6 +584,11 @@ static void ble_prov_worker_task(void *arg) {
         if (stadia_transport_is_ready() && !manual) {
             set_status("Idle (controller connected)");
             vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        if (!manual && esp_timer_get_time() < s_wifi_pause_until_us) {
+            set_status("Paused (Wi-Fi client connecting)");
+            vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
         if (!s_auto_enabled && !manual) {

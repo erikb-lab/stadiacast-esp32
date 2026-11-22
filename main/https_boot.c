@@ -91,6 +91,14 @@ static esp_err_t post_update2(httpd_req_t *req) {
 }
 
 static esp_err_t post_clearcut(httpd_req_t *req) {
+    /* Drain request body cleanly before closing so lwIP never sends a TCP RST */
+    char drain[512];
+    int rem = req->content_len;
+    while (rem > 0) {
+        int r = httpd_req_recv(req, drain, rem > (int)sizeof(drain) ? (int)sizeof(drain) : rem);
+        if (r <= 0) break;
+        rem -= r;
+    }
     ESP_LOGI(TAG, "POST /log/batch");
     return send_response(req, "200 OK", "", 0, NULL, "close");
 }
@@ -160,7 +168,7 @@ static esp_err_t post_register_controller(httpd_req_t *req) {
     /* Build RegisterControllerResponse */
     resp->has_registration_id = true;
     snprintf(resp->registration_id, sizeof(resp->registration_id), "local-%.40s", dev_id[0] ? dev_id : "controller");
-    resp->poll_interval_ms = 1000;
+    resp->poll_interval_ms = 250;
     resp->has_registration_token = true;
     snprintf(resp->registration_token, sizeof(resp->registration_token), "stadia-esp32");
     stadia_sess.registered = true;
@@ -352,41 +360,14 @@ static esp_err_t post_resolve_discovery(httpd_req_t *req) {
     return send_response(req, "200 OK", "", 0, NULL, NULL);
 }
 
-static void gmsg_worker_task(void *arg) {
-    httpd_req_t *req = (httpd_req_t *)arg;
-    uint8_t *msg_buf = malloc(GMMSG_MAX);
+static void gmsg_send_envelope(httpd_req_t *req, const uint8_t *msg_buf, size_t msg_len, uint32_t msg_id) {
     uint8_t *env_buf = malloc(2048);
-    if (!msg_buf || !env_buf) {
-        free(msg_buf);
-        free(env_buf);
-        send_response(req, "503 Service Unavailable", "", 0, "application/x-protobuf", NULL);
-        httpd_req_async_handler_complete(req);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    size_t msg_len = 0;
-    uint32_t msg_id = 1;
-    bool has = stadia_signaling_gmsg_wait(&stadia_sess, 25000, msg_buf, GMMSG_MAX, &msg_len, &msg_id);
-    if (!has) {
-        free(msg_buf);
-        free(env_buf);
-        send_response(req, "200 OK", "", 0, "application/x-protobuf", NULL);
-        httpd_req_async_handler_complete(req);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(TAG, "gmsg: got message id=%lu len=%zu", (unsigned long)msg_id, msg_len);
-
     gotham_discovery_GmsgEnvelope *env = calloc(1, sizeof(*env));
     gotham_discovery_ControllerCommand *cmd = calloc(1, sizeof(*cmd));
     pb_extension_t *ext = calloc(1, sizeof(*ext));
-    if (!env || !cmd || !ext) {
-        free(env); free(cmd); free(ext); free(msg_buf); free(env_buf);
+    if (!env_buf || !env || !cmd || !ext) {
+        free(env_buf); free(env); free(cmd); free(ext);
         send_response(req, "503 Service Unavailable", "", 0, "application/x-protobuf", NULL);
-        httpd_req_async_handler_complete(req);
-        vTaskDelete(NULL);
         return;
     }
 
@@ -415,8 +396,28 @@ static void gmsg_worker_task(void *arg) {
                  ostream.bytes_written, (unsigned long)msg_id);
         send_response(req, "200 OK", (char *)env_buf, ostream.bytes_written, "application/x-protobuf", NULL);
     }
+    free(env_buf); free(env); free(cmd); free(ext);
+}
 
-    free(env); free(cmd); free(ext); free(msg_buf); free(env_buf);
+static void gmsg_worker_task(void *arg) {
+    httpd_req_t *req = (httpd_req_t *)arg;
+    uint8_t *msg_buf = malloc(GMMSG_MAX);
+    if (!msg_buf) {
+        send_response(req, "503 Service Unavailable", "", 0, "application/x-protobuf", NULL);
+        httpd_req_async_handler_complete(req);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    size_t msg_len = 0;
+    uint32_t msg_id = 1;
+    bool has = stadia_signaling_gmsg_wait(&stadia_sess, 25000, msg_buf, GMMSG_MAX, &msg_len, &msg_id);
+    if (!has) {
+        send_response(req, "200 OK", "", 0, "application/x-protobuf", NULL);
+    } else {
+        gmsg_send_envelope(req, msg_buf, msg_len, msg_id);
+    }
+    free(msg_buf);
     httpd_req_async_handler_complete(req);
     vTaskDelete(NULL);
 }
@@ -447,13 +448,26 @@ static esp_err_t gmsg_poll(httpd_req_t *req) {
     free(poll_req);
     free(body);
 
+    /* Fast synchronous path: reply immediately if SDP answer is already queued (zero task spawn) */
+    uint8_t *msg_buf = malloc(GMMSG_MAX);
+    if (msg_buf) {
+        size_t msg_len = 0;
+        uint32_t msg_id = 1;
+        if (stadia_signaling_gmsg_wait(&stadia_sess, 0, msg_buf, GMMSG_MAX, &msg_len, &msg_id)) {
+            gmsg_send_envelope(req, msg_buf, msg_len, msg_id);
+            free(msg_buf);
+            return ESP_OK;
+        }
+        free(msg_buf);
+    }
+
     httpd_req_t *async_req = NULL;
     if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
         ESP_LOGE(TAG, "gmsg: httpd_req_async_handler_begin failed");
         return send_response(req, "503 Service Unavailable", "", 0, "application/x-protobuf", NULL);
     }
 
-    if (xTaskCreate(gmsg_worker_task, "gmsg_worker", 8192, async_req, 5, NULL) != pdPASS) {
+    if (xTaskCreate(gmsg_worker_task, "gmsg_worker", 8192, async_req, 6, NULL) != pdPASS) {
         ESP_LOGE(TAG, "gmsg: xTaskCreate failed");
         send_response(async_req, "503 Service Unavailable", "", 0, "application/x-protobuf", NULL);
         httpd_req_async_handler_complete(async_req);
@@ -518,11 +532,13 @@ static void https_boot_task(void *arg) {
     /* Start HTTPS on :443 */
     httpd_ssl_config_t httpd_ssl = HTTPD_SSL_CONFIG_DEFAULT();
     httpd_ssl.httpd.stack_size = 32768;
+    httpd_ssl.httpd.task_priority = 7;
     httpd_ssl.httpd.max_uri_handlers = 16;
     httpd_ssl.httpd.max_open_sockets = 10;
     httpd_ssl.httpd.lru_purge_enable = true;
     httpd_ssl.httpd.ctrl_port = 32769; /* Avoid collision with port 80 HTTP ctrl_port (32768) */
     httpd_ssl.port_secure = 443;
+    httpd_ssl.session_tickets = true;  /* Fast TLS 1.2 resumption across controller boot requests */
     httpd_ssl.servercert = (const uint8_t *)fullchain_pem_start;
     httpd_ssl.servercert_len = (size_t)(fullchain_pem_end - fullchain_pem_start);
     httpd_ssl.prvtkey_pem = (const uint8_t *)privkey_pem_start;

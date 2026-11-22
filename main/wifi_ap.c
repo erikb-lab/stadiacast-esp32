@@ -1,5 +1,6 @@
 /* Phase 1: Wi-Fi SoftAP (STADIA_ESP32 or custom NVS SSID) for the Stadia controller. */
 #include "wifi_ap.h"
+#include "ble_provision.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,7 @@ static void wifi_ap_event_handler(void *arg, esp_event_base_t base, int32_t id, 
     (void)arg;
     if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STACONNECTED) {
         wifi_event_ap_staconnected_t *e = data;
+        ble_provision_pause_for_wifi_ms(20000); /* Give joining controller 100% exclusive 2.4 GHz airtime */
         ESP_LOGI(TAG, "STA connected: MAC %02x:%02x:%02x:%02x:%02x:%02x",
                  e->mac[0], e->mac[1], e->mac[2], e->mac[3], e->mac[4], e->mac[5]);
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {

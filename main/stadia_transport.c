@@ -187,6 +187,8 @@ bool stadia_transport_is_ready(void) { return g_rpc_ready; }
 int  stadia_transport_get_battery_pct(void) { return g_battery_pct; }
 bool stadia_transport_is_headset_plugged(void) { return g_headset_plugged; }
 
+void stadia_transport_wake(void);
+
 void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
                                  const char *cand_ip, uint16_t cand_port) {
     if (ice_ufrag && ice_ufrag[0]) snprintf(g_pending_ufrag, sizeof(g_pending_ufrag), "%s", ice_ufrag);
@@ -202,6 +204,7 @@ void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
         }
     }
     g_remote_updated = true;
+    stadia_transport_wake();
 }
 
 static int g_wake_sock = -1;
@@ -1316,7 +1319,7 @@ static void service_timers(dtls_link_t *L) {
         pump_dtls(L);
     }
     if (L->peer_seen && L->ctrl_ufrag[0] && L->ctrl_pwd[0]) {
-        int64_t interval_us = L->dtls_seen ? 2500000 : 250000;
+        int64_t interval_us = L->dtls_seen ? 2500000 : 100000;
         if (L->last_stun_tx_us == 0 || (now - L->last_stun_tx_us) >= interval_us) {
             L->last_stun_tx_us = now;
             stun_send_check(L);
@@ -1435,8 +1438,8 @@ static void stadia_transport_task(void *arg) {
         FD_ZERO(&rfds);
         FD_SET(g_disp.sock, &rfds);
         FD_SET(g_game.sock, &rfds);
-        /* Event-driven: wakes instantly via UDP RX or g_wake_sock (rumble / Opus TX); 50ms idle tick */
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 };
+        /* Event-driven: wakes instantly via UDP RX or g_wake_sock; tighter 15ms tick while connecting */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = g_rpc_ready ? 50000 : 15000 };
         int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r > 0) {
             if (FD_ISSET(g_disp.sock, &rfds)) service_socket(&g_disp);
@@ -1446,11 +1449,11 @@ static void stadia_transport_task(void *arg) {
         service_timers(&g_disp);
         service_timers(&g_game);
 
-        /* Display RPC handshake: 600ms after DTLS, retry every 1.5s until READY */
+        /* Display RPC handshake: 40ms after DTLS, retry every 200ms until READY */
         if (g_disp.handshake_done && !g_rpc_ready) {
             int64_t now = esp_timer_get_time();
-            if ((now - g_disp.dtls_done_us) >= 150000 &&
-                (g_last_state_req_us == 0 || (now - g_last_state_req_us) >= 750000)) {
+            if ((now - g_disp.dtls_done_us) >= 40000 &&
+                (g_last_state_req_us == 0 || (now - g_last_state_req_us) >= 200000)) {
                 g_last_state_req_us = now;
                 send_get_controller_state_request();
             }
