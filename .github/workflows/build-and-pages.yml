@@ -1,0 +1,157 @@
+name: Build Firmware & Deploy Web Flasher
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: 'Optional version label (defaults to CMake PROJECT_VER)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v5.5.4
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore TLS private key from repository secret
+        env:
+          STADIA_PRIVKEY_B64: ${{ secrets.STADIA_PRIVKEY_B64 }}
+        run: |
+          if [ -z "$STADIA_PRIVKEY_B64" ]; then
+            echo "::error::Missing repository secret STADIA_PRIVKEY_B64 (base64-encoded main/certs/privkey.pem)."
+            exit 1
+          fi
+          printf '%s' "$STADIA_PRIVKEY_B64" | base64 -d > main/certs/privkey.pem
+
+      - name: Build ESP32-S3 firmware
+        run: |
+          . /opt/esp/idf/export.sh
+          rm -f sdkconfig
+          idf.py set-target esp32s3
+          idf.py build
+
+      - name: Package merged binary, WebSerial manifest, and GitHub Pages site
+        id: meta
+        run: |
+          . /opt/esp/idf/export.sh
+          mkdir -p _site/firmware
+
+          VER="${{ github.event.inputs.version_override }}"
+          if [ -z "$VER" ]; then
+            if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+              VER="${GITHUB_REF_NAME#v}"
+            else
+              VER=$(sed -n 's/^set(PROJECT_VER "\([^"]*\)")/\1/p' CMakeLists.txt)
+            fi
+          fi
+          VER="${VER:-dev}"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+          python -m esptool --chip esp32s3 merge_bin \
+            -o _site/firmware/stadiacast-esp32-merged.bin \
+            --flash_mode dio --flash_freq 80m --flash_size 8MB \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0xf000 build/ota_data_initial.bin \
+            0x20000 build/stadiacast-esp32.bin
+
+          cp build/stadiacast-esp32.bin _site/firmware/stadiacast-esp32.bin
+          cp web/index.html _site/index.html
+
+          SHA256_MERGED=$(sha256sum _site/firmware/stadiacast-esp32-merged.bin | awk '{print $1}')
+          SHA256_APP=$(sha256sum _site/firmware/stadiacast-esp32.bin | awk '{print $1}')
+          BUILT_AT=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          cat > _site/manifest.json <<EOF
+          {
+            "name": "Stadia Wireless Adapter",
+            "version": "v${VER}",
+            "new_install_prompt_erase": false,
+            "builds": [
+              {
+                "chipFamily": "ESP32-S3",
+                "parts": [
+                  { "path": "firmware/stadiacast-esp32-merged.bin", "offset": 0 }
+                ]
+              }
+            ]
+          }
+          EOF
+
+          cat > _site/version.json <<EOF
+          {
+            "version": "v${VER}",
+            "sha": "${GITHUB_SHA}",
+            "built_at": "${BUILT_AT}",
+            "sha256_merged": "${SHA256_MERGED}",
+            "sha256_app": "${SHA256_APP}"
+          }
+          EOF
+
+          (cd _site/firmware && sha256sum stadiacast-esp32-merged.bin stadiacast-esp32.bin > SHA256SUMS.txt)
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stadiacast-esp32-firmware
+          path: _site/firmware/*
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download built firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: stadiacast-esp32-firmware
+          path: dist
+
+      - name: Attach firmware to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cp dist/stadiacast-esp32-merged.bin "stadiacast-esp32-${TAG}-merged.bin"
+          cp dist/stadiacast-esp32.bin "stadiacast-esp32.bin"
+          sha256sum "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" > SHA256SUMS.txt
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" SHA256SUMS.txt --clobber
+          else
+            gh release create "$TAG" "stadiacast-esp32-${TAG}-merged.bin" "stadiacast-esp32.bin" SHA256SUMS.txt \
+              --title "${TAG}" --generate-notes
+          fi

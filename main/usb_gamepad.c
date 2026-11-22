@@ -698,6 +698,15 @@ void usb_gamepad_disconnect(void) {
     }
 }
 
+void usb_gamepad_uninstall(void) {
+    if (s_usb_installed) {
+        s_usb_installed = false;
+        tud_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        (void)tinyusb_driver_uninstall();
+    }
+}
+
 void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
     s_rumble_cb = rumble_cb;
     s_mode = load_mode_from_nvs();

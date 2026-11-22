@@ -1,5 +1,6 @@
 /* Phase 3-5: Display Link (UDP 50000) + Game Session Rumble (UDP 50002). */
 #include "stadia_transport.h"
+#include "ota_updater.h"
 #include "usb_gamepad.h"
 #include "usb_audio.h"
 
@@ -175,11 +176,16 @@ static uint32_t g_last_buttons;
 static int32_t g_last_lx, g_last_ly, g_last_rx, g_last_ry;
 static uint32_t g_last_lt, g_last_rt;
 
-/* Controller battery telemetry (ControllerToDisplay #10, 0.0..1.0) */
+/* Controller battery & headset telemetry */
 static int  g_battery_pct = -1; /* -1 = waiting for first gauge sample */
 static bool g_batt_warn_15 = false;
 static bool g_batt_warn_5  = false;
+static bool g_headset_plugged = false;
 static void haptic_start(int pulses, uint16_t strength);
+
+bool stadia_transport_is_ready(void) { return g_rpc_ready; }
+int  stadia_transport_get_battery_pct(void) { return g_battery_pct; }
+bool stadia_transport_is_headset_plugged(void) { return g_headset_plugged; }
 
 void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
                                  const char *cand_ip, uint16_t cand_port) {
@@ -946,6 +952,13 @@ static void handle_disp_rpc_notification(const uint8_t *payload, size_t len) {
         } else if (ctd->which_variant == gotham_display_ControllerToDisplay_notification10_tag &&
                    ctd->variant.notification10.has_value) {
             handle_battery_float(ctd->variant.notification10.value, "notif10");
+        } else if (ctd->which_variant == gotham_display_ControllerToDisplay_audio_configuration_changed_tag &&
+                   ctd->variant.audio_configuration_changed.has_mode) {
+            uint32_t m = ctd->variant.audio_configuration_changed.mode;
+            if (m == 0 || m == 1) {
+                g_headset_plugged = (m == 1);
+                ESP_LOGI(TAG, "3.5mm headset %s", g_headset_plugged ? "PLUGGED IN" : "UNPLUGGED");
+            }
         }
     }
     free(ctd);
@@ -959,6 +972,7 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
     if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd) &&
         ctd->which_variant == gotham_display_ControllerToDisplay_controller_state_tag) {
         const gotham_display_GetControllerStateResponse *cs = &ctd->variant.controller_state;
+        if (cs->has_f4) g_headset_plugged = cs->f4;
         if (cs->has_f10) {
             float f10_val = 0.0f;
             memcpy(&f10_val, &cs->f10, sizeof(f10_val));
@@ -1237,6 +1251,7 @@ static void pump_dtls(dtls_link_t *L) {
             g_battery_pct = -1;
             g_batt_warn_15 = false;
             g_batt_warn_5 = false;
+            g_headset_plugged = false;
             usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             link_reset(&g_game);
@@ -1405,6 +1420,7 @@ static void stadia_transport_task(void *arg) {
             g_battery_pct = -1;
             g_batt_warn_15 = false;
             g_batt_warn_5 = false;
+            g_headset_plugged = false;
             usb_gamepad_set_battery(-1);
             usb_gamepad_reset();
             snprintf(g_disp.ctrl_ufrag, sizeof(g_disp.ctrl_ufrag), "%s", g_pending_ufrag);
@@ -1471,6 +1487,8 @@ static void stadia_transport_task(void *arg) {
         /* Controller hotkeys & mode switching:
          *   Hold 2s: Assistant + Capture + A -> Stadia HID (1 buzz, fast deauth reboot)
          *   Hold 2s: Assistant + Capture + X -> XInput     (2 buzzes, fast deauth reboot)
+         *   Hold 2s: Assistant + Capture + B -> Home Wi-Fi / LAN Auto-OTA (3 buzzes, reboot)
+         *   Hold 2s: Assistant + Capture + Y -> USB ROM Bootloader Mode   (4 buzzes, reboot)
          *   Tap:     Assistant (XInput mode) OR Assistant + Capture (any mode) -> Mic mute toggle
          *   Tap:     Assistant + Capture + D-Pad Up / Down  -> Mic gain 1.0x / 1.5x / 2.0x / 2.5x
          *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8%
@@ -1483,10 +1501,15 @@ static void stadia_transport_task(void *arg) {
             const uint32_t btn_asst   = (1u << 10);
             const uint32_t btn_cap    = (1u << 11);
             const uint32_t btn_a      = (1u << 12);
+            const uint32_t btn_b      = (1u << 13);
             const uint32_t btn_x      = (1u << 14);
-            const uint32_t combo_base = btn_asst | btn_cap;
+            const uint32_t btn_y      = (1u << 15);
+            const uint32_t face_mask  = btn_a | btn_b | btn_x | btn_y;
+            const uint32_t combo_base   = btn_asst | btn_cap;
             const uint32_t combo_stadia = combo_base | btn_a;
             const uint32_t combo_xinput = combo_base | btn_x;
+            const uint32_t combo_ota    = combo_base | btn_b;
+            const uint32_t combo_boot   = combo_base | btn_y;
 
             static int64_t  s_combo_start_us = 0;
             static uint32_t s_combo_active = 0;
@@ -1559,12 +1582,14 @@ static void stadia_transport_task(void *arg) {
                 }
             }
 
-            /* 2-second hold combos for USB mode switch */
+            /* 2-second hold combos (USB mode switch, Home Wi-Fi Auto-OTA, USB Bootloader) */
             uint32_t matched = 0;
-            if ((cur & combo_stadia) == combo_stadia && !(cur & btn_x)) {
-                matched = combo_stadia;
-            } else if ((cur & combo_xinput) == combo_xinput && !(cur & btn_a)) {
-                matched = combo_xinput;
+            if ((cur & combo_base) == combo_base) {
+                uint32_t face = cur & face_mask;
+                if (face == btn_a)      matched = combo_stadia;
+                else if (face == btn_x) matched = combo_xinput;
+                else if (face == btn_b) matched = combo_ota;
+                else if (face == btn_y) matched = combo_boot;
             }
 
             if (matched != 0) {
@@ -1573,26 +1598,46 @@ static void stadia_transport_task(void *arg) {
                     s_combo_active = matched;
                     s_combo_start_us = now;
                 } else if ((now - s_combo_start_us) >= 2000000) {
-                    usb_gamepad_mode_t target = (matched == combo_xinput)
-                                                ? USB_GAMEPAD_MODE_XINPUT
-                                                : USB_GAMEPAD_MODE_STADIA_HID;
-                    int pulses = (target == USB_GAMEPAD_MODE_XINPUT) ? 2 : 1;
-                    ESP_LOGI(TAG, "Mode combo triggered -> switching USB mode to %s",
-                             (target == USB_GAMEPAD_MODE_XINPUT) ? "XInput" : "Stadia HID");
-                    (void)usb_gamepad_save_mode(target);
-                    for (int p = 0; p < pulses; p++) {
-                        if (g_game.handshake_done) send_game_rumble(0xB000, 0xB000);
-                        vTaskDelay(pdMS_TO_TICKS(150));
-                        if (g_game.handshake_done) send_game_rumble(0, 0);
-                        vTaskDelay(pdMS_TO_TICKS(150));
+                    if (matched == combo_ota) {
+                        if (!ota_updater_schedule_sta_ota()) {
+                            ESP_LOGW(TAG, "Auto-OTA combo ignored: configure Home Wi-Fi at http://192.168.4.1 first");
+                            haptic_start(1, 0x3500);
+                            s_combo_start_us = now + 5000000; /* debounce */
+                        } else {
+                            ESP_LOGI(TAG, "Auto-OTA combo triggered -> rebooting into Home Wi-Fi updater");
+                            for (int p = 0; p < 3; p++) {
+                                if (g_game.handshake_done) send_game_rumble(0x9000, 0x9000);
+                                vTaskDelay(pdMS_TO_TICKS(100));
+                                if (g_game.handshake_done) send_game_rumble(0, 0);
+                                vTaskDelay(pdMS_TO_TICKS(100));
+                            }
+                            ota_updater_reboot_clean(false);
+                        }
+                    } else if (matched == combo_boot) {
+                        ESP_LOGI(TAG, "Bootloader combo triggered -> entering USB ROM Download Mode");
+                        for (int p = 0; p < 4; p++) {
+                            if (g_game.handshake_done) send_game_rumble(0xA000, 0xA000);
+                            vTaskDelay(pdMS_TO_TICKS(80));
+                            if (g_game.handshake_done) send_game_rumble(0, 0);
+                            vTaskDelay(pdMS_TO_TICKS(80));
+                        }
+                        ota_updater_reboot_clean(true);
+                    } else {
+                        usb_gamepad_mode_t target = (matched == combo_xinput)
+                                                    ? USB_GAMEPAD_MODE_XINPUT
+                                                    : USB_GAMEPAD_MODE_STADIA_HID;
+                        int pulses = (target == USB_GAMEPAD_MODE_XINPUT) ? 2 : 1;
+                        ESP_LOGI(TAG, "Mode combo triggered -> switching USB mode to %s",
+                                 (target == USB_GAMEPAD_MODE_XINPUT) ? "XInput" : "Stadia HID");
+                        (void)usb_gamepad_save_mode(target);
+                        for (int p = 0; p < pulses; p++) {
+                            if (g_game.handshake_done) send_game_rumble(0xB000, 0xB000);
+                            vTaskDelay(pdMS_TO_TICKS(150));
+                            if (g_game.handshake_done) send_game_rumble(0, 0);
+                            vTaskDelay(pdMS_TO_TICKS(150));
+                        }
+                        ota_updater_reboot_clean(false);
                     }
-                    /* Deauth STA cleanly so Stadia controller reconnects in ~4-5s instead of 15s */
-                    (void)esp_wifi_deauth_sta(0);
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    (void)esp_wifi_stop();
-                    usb_gamepad_disconnect();
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    esp_restart();
                 }
             } else {
                 s_combo_active = 0;

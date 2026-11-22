@@ -19,6 +19,7 @@ void               usb_gamepad_set_deadzone(uint16_t dz);
 uint16_t           usb_gamepad_get_deadzone(void);
 void               usb_gamepad_set_battery(int pct);
 void               usb_gamepad_disconnect(void);
+void               usb_gamepad_uninstall(void);
 
 void usb_gamepad_send(uint32_t stadia_buttons,
                       int32_t lx, int32_t ly,

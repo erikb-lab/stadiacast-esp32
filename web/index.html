@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="color-scheme" content="light dark">
+  <title>Stadia Wireless Adapter — Web Flasher</title>
+  <script type="module" src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root {
+      --bg-light: #f5f7fb;
+      --bg-dark: #0d1017;
+      --card-light: #ffffff;
+      --card-dark: #161b26;
+      --sub-light: #eef2f8;
+      --sub-dark: #111520;
+      --bd-light: #d7deeb;
+      --bd-dark: #273043;
+      --fg-light: #151923;
+      --fg-dark: #eaf0fb;
+      --mut-light: #566075;
+      --mut-dark: #93a0b8;
+      --acc-light: #e2511e;
+      --acc-dark: #ff6b35;
+      --ok-light: #0f766e;
+      --ok-dark: #34d399;
+
+      --bg: var(--bg-light);
+      --card: var(--card-light);
+      --sub: var(--sub-light);
+      --bd: var(--bd-light);
+      --fg: var(--fg-light);
+      --mut: var(--mut-light);
+      --acc: var(--acc-light);
+      --ok: var(--ok-light);
+
+      @media (prefers-color-scheme: dark) {
+        --bg: var(--bg-dark);
+        --card: var(--card-dark);
+        --sub: var(--sub-dark);
+        --bd: var(--bd-dark);
+        --fg: var(--fg-dark);
+        --mut: var(--mut-dark);
+        --acc: var(--acc-dark);
+        --ok: var(--ok-dark);
+      }
+
+      @supports (color: light-dark(white, black)) {
+        --bg: light-dark(var(--bg-light), var(--bg-dark));
+        --card: light-dark(var(--card-light), var(--card-dark));
+        --sub: light-dark(var(--sub-light), var(--sub-dark));
+        --bd: light-dark(var(--bd-light), var(--bd-dark));
+        --fg: light-dark(var(--fg-light), var(--fg-dark));
+        --mut: light-dark(var(--mut-light), var(--mut-dark));
+        --acc: light-dark(var(--acc-light), var(--acc-dark));
+        --ok: light-dark(var(--ok-light), var(--ok-dark));
+      }
+
+      color-scheme: light dark;
+      accent-color: var(--acc);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 24px 16px 48px;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.55;
+      background: var(--bg);
+      color: var(--fg);
+    }
+    header, main, footer {
+      max-width: 820px;
+      margin-inline: auto;
+    }
+    header {
+      margin-bottom: 20px;
+    }
+    h1 {
+      font-size: clamp(1.6rem, 4vw, 2.15rem);
+      line-height: 1.2;
+      margin: 0 0 8px;
+    }
+    h2 {
+      font-size: 1.15rem;
+      margin: 0 0 12px;
+    }
+    p { margin: 0 0 12px; }
+    .lead { color: var(--mut); font-size: 1rem; margin-bottom: 0; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--bd);
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin: 14px 0 18px;
+    }
+    .stat {
+      background: var(--sub);
+      border: 1px solid var(--bd);
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .stat-k { font-size: 0.75rem; color: var(--mut); text-transform: uppercase; letter-spacing: 0.04em; }
+    .stat-v { font-size: 1rem; font-weight: 650; margin-top: 2px; word-break: break-all; }
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 11px 18px;
+      border-radius: 10px;
+      border: 1px solid transparent;
+      font-size: 0.95rem;
+      font-weight: 650;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .btn-primary {
+      background: var(--acc);
+      color: #fff;
+    }
+    .btn-secondary {
+      background: var(--sub);
+      color: var(--fg);
+      border-color: var(--bd);
+    }
+    .note {
+      font-size: 0.88rem;
+      color: var(--mut);
+      margin-top: 12px;
+    }
+    .warn-box {
+      background: var(--sub);
+      border-left: 4px solid var(--acc);
+      border-radius: 8px;
+      padding: 12px 14px;
+      margin-top: 12px;
+      font-size: 0.9rem;
+    }
+    ol, ul { margin: 0 0 12px; padding-left: 20px; }
+    li { margin-bottom: 6px; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--bd);
+    }
+    th { color: var(--mut); font-weight: 600; }
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.86em;
+      background: var(--sub);
+      padding: 2px 5px;
+      border-radius: 5px;
+    }
+    pre {
+      background: var(--sub);
+      border: 1px solid var(--bd);
+      border-radius: 10px;
+      padding: 12px;
+      overflow-x: auto;
+      margin: 10px 0 0;
+    }
+    pre code { background: none; padding: 0; }
+    details {
+      border: 1px solid var(--bd);
+      border-radius: 10px;
+      padding: 10px 14px;
+      margin-top: 10px;
+      background: var(--sub);
+    }
+    summary {
+      cursor: pointer;
+      font-weight: 600;
+    }
+    details[open] summary { margin-bottom: 10px; }
+    footer {
+      color: var(--mut);
+      font-size: 0.85rem;
+      margin-top: 24px;
+      display: flex;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    footer a { color: var(--acc); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Stadia Wireless Adapter — Web Flasher</h1>
+    <p class="lead">
+      Turn a Seeed Studio XIAO ESP32-S3 into a standalone 1000 Hz Stadia Wi-Fi Gamepad + Rumble + 48 kHz Headset + Battery + Auto-BLE-Pairing USB-C dongle directly from your browser.
+    </p>
+  </header>
+
+  <main>
+    <section class="card" aria-labelledby="install-heading">
+      <h2 id="install-heading">Install Latest Build via WebSerial</h2>
+      <p>
+        Built automatically from <code>main</code> with ESP-IDF 5.5.4 (dual-OTA layout with rollback safety).
+      </p>
+
+      <div class="meta-grid" aria-live="polite">
+        <div class="stat">
+          <div class="stat-k">Firmware Version</div>
+          <div class="stat-v" id="fw-ver">Loading…</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">Target Board</div>
+          <div class="stat-v">XIAO ESP32-S3</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">Commit</div>
+          <div class="stat-v" id="fw-sha">Loading…</div>
+        </div>
+        <div class="stat">
+          <div class="stat-k">Built (UTC)</div>
+          <div class="stat-v" id="fw-date">Loading…</div>
+        </div>
+      </div>
+
+      <div class="actions">
+        <esp-web-install-button manifest="./manifest.json">
+          <button type="button" slot="activate" class="btn btn-primary">Connect &amp; Install Firmware</button>
+          <span slot="unsupported" class="warn-box">
+            WebSerial requires Chrome, Edge, or Brave on desktop. Download the binary below to flash via <code>esptool</code> instead.
+          </span>
+          <span slot="not-allowed" class="warn-box">
+            WebSerial requires HTTPS. Open this page via GitHub Pages (<code>https://</code>).
+          </span>
+        </esp-web-install-button>
+
+        <a class="btn btn-secondary" href="./firmware/stadiacast-esp32.bin" download>
+          Download OTA .bin
+        </a>
+        <a class="btn btn-secondary" href="./firmware/stadiacast-esp32-merged.bin" download>
+          Download Merged .bin
+        </a>
+        <a class="btn btn-secondary" href="https://github.com/erikb-lab/stadiacast-esp32/actions/workflows/build-and-pages.yml" target="_blank" rel="noopener">
+          Trigger Rebuild on GitHub
+        </a>
+      </div>
+
+      <p class="note" id="fw-sha256"></p>
+    </section>
+
+    <section class="card" aria-labelledby="steps-heading">
+      <h2 id="steps-heading">Quick Start (3 Steps)</h2>
+      <ol>
+        <li>
+          <strong>Enter Bootloader Mode:</strong> Hold the <strong>B (BOOT)</strong> button on your XIAO ESP32-S3, plug it into USB-C (or tap <strong>R</strong>), then release <strong>B</strong>.
+          <br><span class="note">Already running v1.5.0+? Hold <strong>Assistant + Capture + Y</strong> (2 s) or click <em>Enter USB Bootloader</em> at <code>http://192.168.4.1</code> — no button press needed.</span>
+        </li>
+        <li>
+          <strong>Flash:</strong> Click <strong>Connect &amp; Install Firmware</strong> above, choose the <strong>USB JTAG/serial debug unit</strong> port, and wait for flashing to complete. Unplug and replug the dongle.
+        </li>
+        <li>
+          <strong>Auto-Pair Your Controller:</strong> Put any Wi-Fi Stadia Controller into orange-blink setup mode near the dongle. The ESP32-S3 automatically pairs it over Bluetooth LE within seconds — no phone app or PC tool required.
+        </li>
+      </ol>
+
+      <details>
+        <summary>Prefer CLI flashing (esptool)?</summary>
+        <pre role="region" aria-label="esptool flash command" tabindex="0"><code>python3 -m esptool --chip esp32s3 --baud 460800 \
+  --before default-reset --after hard-reset write-flash \
+  --flash-mode dio --flash-freq 80m --flash-size 8MB \
+  0x0 stadiacast-esp32-merged.bin</code></pre>
+      </details>
+
+      <details>
+        <summary>Updating later over Wi-Fi (OTA) — no USB cable flashing needed</summary>
+        <p>Once flashed with v1.5.0+, connect any phone or PC to the dongle's Wi-Fi (<code>STADIA_ESP32</code> / <code>stadiacast</code>) and open <code>http://192.168.4.1</code> to upload <code>stadiacast-esp32.bin</code> in your browser, configure settings, or save your Home Wi-Fi for 1-button controller updates (<strong>Assistant + Capture + B</strong>).</p>
+      </details>
+    </section>
+
+    <section class="card" aria-labelledby="hotkeys-heading">
+      <h2 id="hotkeys-heading">Controller Hotkeys</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Action</th>
+            <th>Combo</th>
+            <th>Feedback</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Stadia HID Mode (<code>18d1:9400</code>)</td>
+            <td>Hold <strong>Assistant + Capture + A</strong> (2 s)</td>
+            <td>1 long buzz, reboots</td>
+          </tr>
+          <tr>
+            <td>XInput Mode (<code>1209:9401</code>)</td>
+            <td>Hold <strong>Assistant + Capture + X</strong> (2 s)</td>
+            <td>2 long buzzes, reboots</td>
+          </tr>
+          <tr>
+            <td>Home Wi-Fi / LAN Auto-OTA</td>
+            <td>Hold <strong>Assistant + Capture + B</strong> (2 s)</td>
+            <td>3 buzzes, downloads latest release</td>
+          </tr>
+          <tr>
+            <td>USB Serial / Flash Mode</td>
+            <td>Hold <strong>Assistant + Capture + Y</strong> (2 s)</td>
+            <td>4 buzzes, reboots to USB-Serial</td>
+          </tr>
+          <tr>
+            <td>Mic Mute Toggle</td>
+            <td>Tap <strong>Assistant</strong> <em>(XInput)</em> or <strong>Assistant + Capture</strong></td>
+            <td>1 buzz = muted, 2 = live</td>
+          </tr>
+          <tr>
+            <td>Mic Gain (<code>1.0x–2.5x</code>)</td>
+            <td><strong>Assistant + Capture</strong> + <strong>D-Pad Up / Down</strong></td>
+            <td>1–4 quick taps</td>
+          </tr>
+          <tr>
+            <td>Stick Deadzone (<code>0% / 4% / 8%</code>)</td>
+            <td><strong>Assistant + Capture</strong> + <strong>D-Pad Right</strong></td>
+            <td>1–3 quick taps</td>
+          </tr>
+          <tr>
+            <td>Check Battery Level</td>
+            <td><strong>Assistant + Capture</strong> + <strong>D-Pad Left</strong></td>
+            <td>1–4 taps (quartile)</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    <span>Open-source firmware for Seeed Studio XIAO ESP32-S3.</span>
+    <a href="https://github.com/erikb-lab/stadiacast-esp32" target="_blank" rel="noopener">GitHub Repository</a>
+  </footer>
+
+  <script>
+    (async () => {
+      try {
+        const r = await fetch("./version.json", { cache: "no-store" });
+        if (!r.ok) return;
+        const v = await r.json();
+        document.getElementById("fw-ver").textContent = v.version || "unknown";
+        document.getElementById("fw-sha").textContent = (v.sha || "").slice(0, 8) || "unknown";
+        document.getElementById("fw-date").textContent = v.built_at || "unknown";
+        if (v.sha256_merged) {
+          document.getElementById("fw-sha256").textContent =
+            "Merged SHA-256: " + v.sha256_merged;
+        }
+      } catch (_) {}
+    })();
+  </script>
+</body>
+</html>

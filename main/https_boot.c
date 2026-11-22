@@ -22,6 +22,7 @@
 #include "webrtc_sdp.pb.h"
 #include "stadia_signaling.h"
 #include "stadia_transport.h"
+#include "web_ui.h"
 #include "mbedtls/sha256.h"
 
 #define TAG "HTTPS"
@@ -476,14 +477,18 @@ static httpd_handle_t http80 = NULL;
 
 static void https_boot_init_http80(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.stack_size = 4096;
-    config.max_uri_handlers = 4;
+    config.stack_size = 8192;
+    config.max_uri_handlers = 12;
+    config.recv_wait_timeout = 30;
+    config.send_wait_timeout = 30;
+    config.lru_purge_enable = true;
     if (httpd_start(&http80, &config) != ESP_OK) {
         ESP_LOGE(TAG, "httpd start failed on :80");
         return;
     }
     httpd_register_uri_handler(http80, &http80_uri);
-    ESP_LOGI(TAG, "HTTP server on :80");
+    web_ui_register(http80);
+    ESP_LOGI(TAG, "HTTP server + Web UI/OTA on :80");
 }
 
 static const httpd_uri_t uris[] = {
