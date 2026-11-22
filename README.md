@@ -23,9 +23,12 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
   - **`2–4 Players` (Experimental Co-Op):** Dedicates all 4 ESP32-S3 hardware USB-OTG IN endpoints (`EP1..EP4`) and 4 dual-port DTLS 1.2 + SCTP transport pairs (`UDP 50000..50014`) to expose **2, 3, or 4 independent XInput (Xbox 360) or Stadia HID gamepads** with independent per-player rumble and battery reporting over a single USB port (disables UAC1 USB audio while `>1` player is active).
 - **On-Board BLE Auto-Provisioning (Zero Phone/PC App Needed):**
   - Put any Wi-Fi Stadia Controller into orange-blink setup mode near the dongle and the ESP32-S3 automatically pairs it over Bluetooth LE (`0xFE2C` Fast Pair → `0xFEA0` RSA-2048 encrypted credentials). BLE scanning pauses completely while a controller is connected over Wi-Fi so there is zero gaming/audio jitter.
-- **Web Dashboard + Over-the-Air (OTA) Firmware Updates (`http://192.168.4.1`):**
+- **Web Dashboard + Live Visualizer + Over-the-Air (OTA) Firmware Updates (`http://192.168.4.1`):**
   - Dual 3 MB OTA partitions with automatic rollback protection.
-  - Configure USB mode, mic mute/gain, stick deadzone, Wi-Fi TX power, custom SoftAP SSID/password, and upload firmware `.bin` files right from any browser — or save your Home Wi-Fi for 1-button GitHub/LAN Auto-OTA (**Assistant + Capture + B**).
+  - Built-in **Live Controller Visualizer** (real-time sticks, analog triggers, buttons, and rumble tester) plus **live controller Wi-Fi RSSI (dBm)** and DRAM/PSRAM usage telemetry via `/api/input` & `/api/status`.
+  - Configure USB mode, 1–4 player mode, mic mute/gain, stick deadzone, Wi-Fi TX power (`+8` to `+20 dBm`), custom SoftAP SSID/password, and upload firmware `.bin` files right from any browser — or save your Home Wi-Fi for 1-button GitHub/LAN Auto-OTA (**Assistant + Capture + B**).
+- **Wireless Range (Real-World Tested):**
+  - **Seeed Studio XIAO ESP32-S3 (stock U.FL stick-on antenna, `+20 dBm`):** Stable up to **~30 ft (~9 m)**. Use a higher-gain external 2.4 GHz U.FL antenna if you need longer range.
 - **Live Controller Battery Reporting**:
   - **Native OS Battery Gauge (Stadia HID mode):** Standard USB HID Battery Strength (Report ID 4, `0–100%`) — shows up automatically in Linux UPower / KDE Plasma / GNOME (`gaming-input`) with zero extra drivers or daemons. Reads initial charge immediately on connect (`GetControllerStateResponse.f10`), tracks live 1% steps (`notification10`), and caches the last known level in NVS across reboots.
   - **Low-Battery Alerts & On-Demand Check (Both Modes):** Haptic alerts at `≤ 15%` (3 buzzes) and `≤ 5%` (5 buzzes) with hysteresis, status LED double-dip warning, plus an instant quartile buzz hotkey.
@@ -76,6 +79,8 @@ GitHub Actions automatically builds **3 firmware variants** on every commit and 
 | **[M5Stack StampS3](https://www.amazon.com/s?k=M5Stack+StampS3+ESP32-S3)** | `S3FN8` · 8 MB Flash · **No PSRAM** | USB-C | `stadiacast-esp32-s3-nopsram` | <!-- board:m5stack-stamps3 --> 🧪 Untested |
 
 > **Tested one of the `🧪 Untested` boards?** Open an issue or PR (or maintainers can run `./tools/set_board_status.sh <board-id> tested`) to mark it verified!
+>
+> **Wireless Range Note:** Real-world range testing on the **Seeed Studio XIAO ESP32-S3 with its stock U.FL antenna** (`+20 dBm` TX power) measured **stable operation up to ~30 ft (~9 m)**.
 >
 > *(Note: `ESP32-C3`, `ESP32-C5`, `ESP32-C6`, `ESP32-H2`, and original `ESP32` chips do **not** have a programmable USB-OTG peripheral and cannot run this firmware.)*
 
