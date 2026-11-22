@@ -617,6 +617,23 @@ void usb_gamepad_send(uint32_t b,
     push_reports(&hid, &xin, &canon);
 }
 
+void usb_gamepad_get_latest_input(uint32_t *buttons,
+                                  int32_t *lx, int32_t *ly,
+                                  int32_t *rx, int32_t *ry,
+                                  uint8_t *lt, uint8_t *rt) {
+    usb_canonical_input_t c;
+    portENTER_CRITICAL(&s_hid_mux);
+    c = s_latest_canon;
+    portEXIT_CRITICAL(&s_hid_mux);
+    if (buttons) *buttons = c.buttons;
+    if (lx)      *lx      = c.lx;
+    if (ly)      *ly      = c.ly;
+    if (rx)      *rx      = c.rx;
+    if (ry)      *ry      = c.ry;
+    if (lt)      *lt      = c.lt;
+    if (rt)      *rt      = c.rt;
+}
+
 void usb_gamepad_reset(void) {
     stadia_hid_report_t hid_neutral = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
     xinput_report_t xin_neutral = { .report_id = 0x00, .report_size = 0x14 };

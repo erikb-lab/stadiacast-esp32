@@ -32,6 +32,10 @@ void usb_gamepad_send(uint32_t stadia_buttons,
                       int32_t lx, int32_t ly,
                       int32_t rx, int32_t ry,
                       uint32_t lt, uint32_t rt);
+void usb_gamepad_get_latest_input(uint32_t *buttons,
+                                  int32_t *lx, int32_t *ly,
+                                  int32_t *rx, int32_t *ry,
+                                  uint8_t *lt, uint8_t *rt);
 void usb_gamepad_reset(void);
 void usb_gamepad_keepalive_tick(void);
 

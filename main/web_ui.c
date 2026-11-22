@@ -61,6 +61,16 @@ static const char k_index_html[] =
 ".pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:.75rem;font-weight:600;background:#262d3f}"
 ".pill.ok{background:#064e3b;color:#6ee7b7}.pill.wait{background:#3f2e12;color:#fcd34d}"
 "small{color:var(--mut);font-size:.78rem;display:block;margin-top:4px}"
+".vgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:10px}"
+"@media(max-width:520px){.vgrid{grid-template-columns:1fr}}"
+".stick-box{display:flex;align-items:center;gap:12px;background:#12151e;border:1px solid var(--bd);border-radius:10px;padding:10px}"
+".pad-ring{position:relative;width:84px;height:84px;border-radius:50%;background:#0b0d13;border:1px solid #333b4f;flex-shrink:0}"
+".pad-ring::before,.pad-ring::after{content:'';position:absolute;background:#222838}"
+".pad-ring::before{left:50%;top:0;bottom:0;width:1px}.pad-ring::after{top:50%;left:0;right:0;height:1px}"
+".pad-dot{position:absolute;width:12px;height:12px;border-radius:50%;background:var(--acc);transform:translate(-50%,-50%);left:50%;top:50%;box-shadow:0 0 8px var(--acc)}"
+".bgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(62px,1fr));gap:6px;margin-top:10px}"
+".bchip{background:#12151e;border:1px solid var(--bd);border-radius:7px;padding:6px 4px;text-align:center;font-size:.76rem;font-weight:600;color:var(--mut);user-select:none;transition:background .05s,color .05s,border-color .05s}"
+".bchip.on{background:var(--acc);color:#fff;border-color:var(--acc);box-shadow:0 0 10px rgba(255,107,53,.45)}"
 "</style></head><body>"
 "<h1>Stadia Wireless Adapter</h1>"
 "<div class=sub>Firmware <span id=ver>...</span> &middot; Slot <span id=slot>...</span> &middot; <span id=conn class='pill wait'>Checking...</span></div>"
@@ -71,6 +81,30 @@ static const char k_index_html[] =
 "<div class=stat><div class=k>3.5 mm Headset</div><div class=v id=hs>--</div></div>"
 "<div class=stat><div class=k>Microphone</div><div class=v id=mic>--</div></div>"
 "</div><div id=otaMsg class=msg></div></div>"
+
+"<div class=card><div class=row style='justify-content:space-between'>"
+"<h2 style='margin:0'>Live Controller Visualizer</h2>"
+"<div style='display:flex;gap:8px'>"
+"<button id=btnViz class=sec onclick='toggleViz()'>Start Live Monitor</button>"
+"<button class=sec onclick='testRumble()'>Test Rumble</button></div></div>"
+"<div id=vizBody style='display:none;margin-top:10px'>"
+"<div class=vgrid>"
+"<div class=stick-box><div><div class=k style='font-size:.75rem;color:var(--mut)'>L2 Trigger</div>"
+"<div style='font-weight:600;font-size:.95rem' id=ltVal>0 / 255 (0%)</div></div>"
+"<div style='flex:1'><div class=bar style='margin:0'><div id=ltBar></div></div></div></div>"
+"<div class=stick-box><div><div class=k style='font-size:.75rem;color:var(--mut)'>R2 Trigger</div>"
+"<div style='font-weight:600;font-size:.95rem' id=rtVal>0 / 255 (0%)</div></div>"
+"<div style='flex:1'><div class=bar style='margin:0'><div id=rtBar></div></div></div></div>"
+"<div class=stick-box><div class=pad-ring><div id=lDot class=pad-dot></div></div>"
+"<div><div style='font-size:.78rem;color:var(--mut)'>Left Stick</div>"
+"<div style='font-family:monospace;font-size:.85rem;margin-top:2px' id=lTxt>X:     0\nY:     0</div></div></div>"
+"<div class=stick-box><div class=pad-ring><div id=rDot class=pad-dot></div></div>"
+"<div><div style='font-size:.78rem;color:var(--mut)'>Right Stick</div>"
+"<div style='font-family:monospace;font-size:.85rem;margin-top:2px' id=rTxt>X:     0\nY:     0</div></div></div>"
+"</div>"
+"<div class=bgrid id=btnGrid></div>"
+"<small>Polls live input at 25 Hz only while open (0% Wi-Fi traffic when closed).</small>"
+"</div></div>"
 
 "<div class=card><h2>Gamepad &amp; Audio</h2>"
 "<div class=row><label>USB Mode</label><select id=selMode>"
@@ -139,7 +173,9 @@ static const char k_index_html[] =
 "document.getElementById('btnMute').textContent=curMute?'Unmute Mic':'Mute Mic';"
 "document.getElementById('otaMsg').textContent=d.ota_msg?('Last OTA: '+d.ota_msg):'';"
 "document.getElementById('bleSt').textContent=d.ble_status||'--';"
-"document.getElementById('mem').textContent='Up '+d.uptime_s+'s · DRAM '+Math.round(d.free_dram/1024)+'KB';"
+"const du=d.total_dram?Math.round((d.total_dram-d.free_dram)*100/d.total_dram):0;"
+"const pu=d.total_psram?((d.total_psram-d.free_psram)*100/d.total_psram).toFixed(1):0;"
+"document.getElementById('mem').textContent='Up '+d.uptime_s+'s · DRAM '+du+'% used ('+Math.round(d.free_dram/1024)+'KB free) · PSRAM '+pu+'% used ('+(d.free_psram/1048576).toFixed(1)+'MB free)';"
 "if(!initDone){initDone=true;document.getElementById('selMode').value=d.usb_mode;"
 "document.getElementById('selGain').value=d.mic_gain_q8;document.getElementById('selDz').value=d.stick_dz;"
 "document.getElementById('selTx').value=d.wifi_tx_qdbm;document.getElementById('apSsid').value=d.ap_ssid;"
@@ -165,6 +201,28 @@ static const char k_index_html[] =
 "x.onload=()=>{btn.disabled=false;try{const d=JSON.parse(x.responseText);msg('upMsg',d.msg||(d.ok?'Flashed! Rebooting...':'Failed'),!d.ok);"
 "if(d.ok)setTimeout(()=>location.reload(),6000);}catch(e){msg('upMsg','HTTP '+x.status+': '+x.responseText,x.status!==200);}};"
 "x.onerror=()=>{btn.disabled=false;msg('upMsg','Upload interrupted',true);};x.send(f);}"
+"const BTNS=[[0,'Up'],[1,'Down'],[2,'Left'],[3,'Right'],[8,'L1'],[9,'R1'],[6,'L3'],[7,'R3'],[5,'Options'],[4,'Menu'],[10,'Asst'],[11,'Capture'],[16,'Stadia'],[12,'A'],[13,'B'],[14,'X'],[15,'Y']];"
+"const bg=document.getElementById('btnGrid');"
+"BTNS.forEach(([b,n])=>{const e=document.createElement('div');e.className='bchip';e.id='b_'+b;e.textContent=n;bg.appendChild(e);});"
+"let vizOn=false,vizTmr=null,vizBusy=false;"
+"function toggleViz(){vizOn=!vizOn;document.getElementById('vizBody').style.display=vizOn?'block':'none';"
+"const b=document.getElementById('btnViz');b.textContent=vizOn?'Stop Live Monitor':'Start Live Monitor';b.className=vizOn?'':'sec';"
+"if(vizOn){pollViz();vizTmr=setInterval(pollViz,40);}else if(vizTmr){clearInterval(vizTmr);vizTmr=null;}}"
+"async function pollViz(){if(!vizOn||vizBusy||document.hidden)return;vizBusy=true;try{"
+"const r=await fetch('/api/input');const d=await r.json();"
+"document.getElementById('ltVal').textContent=d.lt+' / 255 ('+Math.round(d.lt*100/255)+'%)';"
+"document.getElementById('rtVal').textContent=d.rt+' / 255 ('+Math.round(d.rt*100/255)+'%)';"
+"document.getElementById('ltBar').style.width=(d.lt*100/255)+'%';"
+"document.getElementById('rtBar').style.width=(d.rt*100/255)+'%';"
+"document.getElementById('lDot').style.left=(50+d.lx*42/32768)+'%';"
+"document.getElementById('lDot').style.top=(50-d.ly*42/32768)+'%';"
+"document.getElementById('rDot').style.left=(50+d.rx*42/32768)+'%';"
+"document.getElementById('rDot').style.top=(50-d.ry*42/32768)+'%';"
+"document.getElementById('lTxt').textContent='X: '+d.lx+' ('+Math.round(d.lx*100/32767)+'%)\\nY: '+d.ly+' ('+Math.round(d.ly*100/32767)+'%)';"
+"document.getElementById('rTxt').textContent='X: '+d.rx+' ('+Math.round(d.rx*100/32767)+'%)\\nY: '+d.ry+' ('+Math.round(d.ry*100/32767)+'%)';"
+"BTNS.forEach(([bit])=>{const el=document.getElementById('b_'+bit);if(el)el.className='bchip'+((d.b&(1<<bit))?' on':'');});"
+"}catch(e){}vizBusy=false;}"
+"async function testRumble(){try{await fetch('/api/rumble',{method:'POST'});}catch(e){}}"
 "poll();setInterval(poll,3000);"
 "</script></body></html>";
 
@@ -199,7 +257,9 @@ static esp_err_t get_api_status(httpd_req_t *req) {
     cJSON_AddStringToObject(root, "slot", running ? running->label : "unknown");
     cJSON_AddNumberToObject(root, "uptime_s", (double)(esp_timer_get_time() / 1000000LL));
     cJSON_AddNumberToObject(root, "free_dram", (double)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    cJSON_AddNumberToObject(root, "total_dram", (double)heap_caps_get_total_size(MALLOC_CAP_INTERNAL));
     cJSON_AddNumberToObject(root, "free_psram", (double)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    cJSON_AddNumberToObject(root, "total_psram", (double)heap_caps_get_total_size(MALLOC_CAP_SPIRAM));
     cJSON_AddBoolToObject(root, "ready", stadia_transport_is_ready());
     cJSON_AddNumberToObject(root, "battery_pct", stadia_transport_get_battery_pct());
     cJSON_AddBoolToObject(root, "headset", stadia_transport_is_headset_plugged());
@@ -417,6 +477,40 @@ static esp_err_t post_api_ota_sta(httpd_req_t *req) {
     return rc;
 }
 
+static esp_err_t get_api_input(httpd_req_t *req) {
+    uint32_t b = 0;
+    int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    uint8_t lt = 0, rt = 0;
+    usb_gamepad_get_latest_input(&b, &lx, &ly, &rx, &ry, &lt, &rt);
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "{\"ready\":%s,\"b\":%lu,\"lx\":%ld,\"ly\":%ld,\"rx\":%ld,\"ry\":%ld,\"lt\":%u,\"rt\":%u}",
+             stadia_transport_is_ready() ? "true" : "false",
+             (unsigned long)b, (long)lx, (long)ly, (long)rx, (long)ry,
+             (unsigned)lt, (unsigned)rt);
+    return send_json(req, "200 OK", buf);
+}
+
+static void rumble_off_cb(void *arg) {
+    (void)arg;
+    stadia_transport_set_rumble(0, 0);
+}
+
+static esp_err_t post_api_rumble(httpd_req_t *req) {
+    static esp_timer_handle_t s_rmb_tmr = NULL;
+    if (!s_rmb_tmr) {
+        const esp_timer_create_args_t targs = {
+            .callback = &rumble_off_cb,
+            .name = "web_rmb",
+        };
+        (void)esp_timer_create(&targs, &s_rmb_tmr);
+    }
+    if (s_rmb_tmr) (void)esp_timer_stop(s_rmb_tmr);
+    stadia_transport_set_rumble(0xC000, 0xC000);
+    if (s_rmb_tmr) (void)esp_timer_start_once(s_rmb_tmr, 250000);
+    return send_json(req, "200 OK", "{\"ok\":true}");
+}
+
 static esp_err_t post_api_ble_prov(httpd_req_t *req) {
     ble_provision_trigger_now();
     return send_json(req, "200 OK", "{\"ok\":true,\"msg\":\"Scanning for Stadia controller in orange-blink mode...\"}");
@@ -443,10 +537,12 @@ void web_ui_register(httpd_handle_t server) {
     static const httpd_uri_t routes[] = {
         { .uri = "/",             .method = HTTP_GET,  .handler = get_root },
         { .uri = "/api/status",   .method = HTTP_GET,  .handler = get_api_status },
+        { .uri = "/api/input",    .method = HTTP_GET,  .handler = get_api_input },
         { .uri = "/api/settings", .method = HTTP_POST, .handler = post_api_settings },
         { .uri = "/api/ota",      .method = HTTP_POST, .handler = post_api_ota },
         { .uri = "/api/ota-sta",  .method = HTTP_POST, .handler = post_api_ota_sta },
         { .uri = "/api/ble-prov", .method = HTTP_POST, .handler = post_api_ble_prov },
+        { .uri = "/api/rumble",   .method = HTTP_POST, .handler = post_api_rumble },
         { .uri = "/api/reboot",   .method = HTTP_POST, .handler = post_api_reboot },
     };
     for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
