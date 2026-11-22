@@ -1,5 +1,7 @@
-/* Phase 3-5: Display Link (UDP 50000) + Game Session Rumble (UDP 50002). */
+/* Phase 3-5: Display Link (UDP 50000+slot*4) + Game Session Rumble (UDP 50002+slot*4)
+ * Supports 1..4 Concurrent Stadia Controllers. */
 #include "stadia_transport.h"
+#include "stadia_signaling.h"
 #include "ota_updater.h"
 #include "usb_gamepad.h"
 #include "usb_audio.h"
@@ -16,6 +18,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "esp_attr.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_system.h"
@@ -42,6 +45,12 @@
 #include "webrtc_sdp.pb.h"
 
 #define TAG "P3-RTC"
+
+#if CONFIG_SPIRAM
+#define STADIA_EXT_BSS EXT_RAM_BSS_ATTR
+#else
+#define STADIA_EXT_BSS
+#endif
 
 #define DISP_UDP_PORT             50000
 #define GAME_UDP_PORT             50002
@@ -91,6 +100,8 @@ typedef struct {
 
 typedef struct {
     const char *name;
+    int         slot;
+    bool        is_game;
     uint16_t    local_port;
     const char *our_ufrag;
     const char *our_pwd;
@@ -111,6 +122,57 @@ typedef struct {
     stadia_srtp_ctx_t srtp;
 } dtls_link_t;
 
+typedef struct {
+    int         slot;
+    dtls_link_t disp;
+    dtls_link_t game;
+
+    volatile bool remote_updated;
+    char        pending_ufrag[64];
+    char        pending_pwd[64];
+    struct sockaddr_in pending_cand;
+    bool        pending_cand_valid;
+
+    bool        rpc_ready;
+    bool        start_game_sent;
+    int64_t     last_state_req_us;
+    uint32_t    rpc_ticket;
+
+    volatile uint16_t rumble_left_req;
+    volatile uint16_t rumble_right_req;
+    volatile bool     rumble_dirty;
+    uint16_t    rumble_left_sent;
+    uint16_t    rumble_right_sent;
+    int64_t     last_rumble_tx_us;
+    uint64_t    game_tx_seq;
+    bool        game_use_rtp;
+    uint16_t    game_rtp_seq;
+    char        game_session_id[64];
+    uint32_t    game_pad_id;
+
+    bool        last_set;
+    uint32_t    last_buttons;
+    int32_t     last_lx, last_ly, last_rx, last_ry;
+    uint32_t    last_lt, last_rt;
+
+    int         battery_pct;
+    bool        batt_warn_15;
+    bool        batt_warn_5;
+    bool        headset_plugged;
+
+    int         haptic_pulses_left;
+    bool        haptic_on;
+    uint16_t    haptic_strength;
+    int64_t     haptic_next_us;
+
+    int64_t     combo_start_us;
+    uint32_t    combo_active;
+    uint32_t    prev_btn;
+    int64_t     asst_down_us;
+    bool        asst_chord_used;
+    bool        both_down;
+} stadia_player_t;
+
 /* Shared mbedTLS config/cert/RNG */
 static mbedtls_ssl_config g_conf;
 static mbedtls_x509_crt g_srv_cert;
@@ -120,34 +182,15 @@ static mbedtls_entropy_context g_entropy;
 static char g_cert_fp[112];
 static bool g_tls_shared_init;
 
-static dtls_link_t g_disp = {
-    .name = "DISP", .local_port = DISP_UDP_PORT,
-    .our_ufrag = DISP_ICE_UFRAG, .our_pwd = DISP_ICE_PWD, .sock = -1
-};
-static dtls_link_t g_game = {
-    .name = "GAME", .local_port = GAME_UDP_PORT,
-    .our_ufrag = GAME_ICE_UFRAG, .our_pwd = GAME_ICE_PWD, .sock = -1
-};
+STADIA_EXT_BSS static stadia_player_t g_players[STADIA_MAX_PLAYERS];
 
 /* Task-owned scratch buffers (off stack) */
-static uint8_t g_udp_buf[RX_BUF_MAX];
-static uint8_t g_app_buf[RX_BUF_MAX];
-static uint8_t g_wire_tx[WIRE_HDR_LEN + TX_BUF_MAX];
-static uint8_t g_rpc_tx[TX_BUF_MAX];
+STADIA_EXT_BSS static uint8_t g_udp_buf[RX_BUF_MAX];
+STADIA_EXT_BSS static uint8_t g_app_buf[RX_BUF_MAX];
+STADIA_EXT_BSS static uint8_t g_wire_tx[WIRE_HDR_LEN + TX_BUF_MAX];
+STADIA_EXT_BSS static uint8_t g_rpc_tx[TX_BUF_MAX];
 
-/* Display link -> Game session state */
-static volatile bool g_remote_updated;
-static char g_pending_ufrag[64];
-static char g_pending_pwd[64];
-static struct sockaddr_in g_pending_cand;
-static bool g_pending_cand_valid;
-
-static bool g_rpc_ready;
-static bool g_start_game_sent;
-static int64_t g_last_state_req_us;
-static uint32_t g_rpc_ticket;
-
-/* Phase 6A: SRTP bidirectional audio state */
+/* Phase 6A: SRTP bidirectional audio state (Player 1 when max_players == 1) */
 static bool     g_audio_enabled;
 static int64_t  g_audio_next_tx_us;
 static uint16_t g_audio_seq;
@@ -157,54 +200,68 @@ static uint32_t g_mic_rx_pkts;
 static uint32_t g_mic_rx_bytes;
 static uint8_t  g_audio_tx_buf[512];
 
-/* Game session rumble state */
-static volatile uint16_t g_rumble_left_req;
-static volatile uint16_t g_rumble_right_req;
-static volatile bool g_rumble_dirty;
-static uint16_t g_rumble_left_sent;
-static uint16_t g_rumble_right_sent;
-static int64_t g_last_rumble_tx_us;
-static uint64_t g_game_tx_seq;
-static bool g_game_use_rtp;
-static uint16_t g_game_rtp_seq;
-static char g_game_session_id[64];
-static uint32_t g_game_pad_id;
+static void haptic_start(stadia_player_t *P, int pulses, uint16_t strength);
 
-/* Last decoded input state */
-static bool g_last_set;
-static uint32_t g_last_buttons;
-static int32_t g_last_lx, g_last_ly, g_last_rx, g_last_ry;
-static uint32_t g_last_lt, g_last_rt;
+bool stadia_transport_is_slot_ready(int slot) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) return false;
+    return g_players[slot].rpc_ready;
+}
 
-/* Controller battery & headset telemetry */
-static int  g_battery_pct = -1; /* -1 = waiting for first gauge sample */
-static bool g_batt_warn_15 = false;
-static bool g_batt_warn_5  = false;
-static bool g_headset_plugged = false;
-static void haptic_start(int pulses, uint16_t strength);
+bool stadia_transport_is_ready(void) {
+    for (int i = 0; i < STADIA_MAX_PLAYERS; i++) {
+        if (g_players[i].rpc_ready) return true;
+    }
+    return false;
+}
 
-bool stadia_transport_is_ready(void) { return g_rpc_ready; }
-int  stadia_transport_get_battery_pct(void) { return g_battery_pct; }
-bool stadia_transport_is_headset_plugged(void) { return g_headset_plugged; }
+int stadia_transport_get_slot_battery_pct(int slot) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) return -1;
+    return g_players[slot].battery_pct;
+}
+
+int stadia_transport_get_battery_pct(void) {
+    return g_players[0].battery_pct;
+}
+
+bool stadia_transport_is_headset_plugged(void) {
+    return g_players[0].headset_plugged;
+}
+
+int stadia_transport_get_connected_count(void) {
+    int cnt = 0;
+    int max_p = (int)usb_gamepad_get_max_players();
+    if (max_p > STADIA_MAX_PLAYERS) max_p = STADIA_MAX_PLAYERS;
+    for (int i = 0; i < max_p; i++) {
+        if (g_players[i].rpc_ready) cnt++;
+    }
+    return cnt;
+}
 
 void stadia_transport_wake(void);
 
-void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
-                                 const char *cand_ip, uint16_t cand_port) {
-    if (ice_ufrag && ice_ufrag[0]) snprintf(g_pending_ufrag, sizeof(g_pending_ufrag), "%s", ice_ufrag);
-    if (ice_pwd && ice_pwd[0])     snprintf(g_pending_pwd,   sizeof(g_pending_pwd),   "%s", ice_pwd);
-    g_pending_cand_valid = false;
+void stadia_transport_set_remote_slot(int slot, const char *ice_ufrag, const char *ice_pwd,
+                                      const char *cand_ip, uint16_t cand_port) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) slot = 0;
+    stadia_player_t *P = &g_players[slot];
+    if (ice_ufrag && ice_ufrag[0]) snprintf(P->pending_ufrag, sizeof(P->pending_ufrag), "%s", ice_ufrag);
+    if (ice_pwd && ice_pwd[0])     snprintf(P->pending_pwd,   sizeof(P->pending_pwd),   "%s", ice_pwd);
+    P->pending_cand_valid = false;
     if (cand_ip && cand_ip[0] && cand_port > 0) {
         struct sockaddr_in a = {0};
         a.sin_family = AF_INET;
         a.sin_port = htons(cand_port);
         if (inet_pton(AF_INET, cand_ip, &a.sin_addr) == 1) {
-            g_pending_cand = a;
-            g_pending_cand_valid = true;
+            P->pending_cand = a;
+            P->pending_cand_valid = true;
         }
     }
-    g_remote_updated = true;
+    P->remote_updated = true;
     stadia_transport_wake();
+}
+
+void stadia_transport_set_remote(const char *ice_ufrag, const char *ice_pwd,
+                                 const char *cand_ip, uint16_t cand_port) {
+    stadia_transport_set_remote_slot(0, ice_ufrag, ice_pwd, cand_ip, cand_port);
 }
 
 static int g_wake_sock = -1;
@@ -220,11 +277,16 @@ void stadia_transport_wake(void) {
     }
 }
 
-void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
-    g_rumble_left_req = left_strong;
-    g_rumble_right_req = right_weak;
-    g_rumble_dirty = true;
+void stadia_transport_set_rumble_slot(int slot, uint16_t left_strong, uint16_t right_weak) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) return;
+    g_players[slot].rumble_left_req = left_strong;
+    g_players[slot].rumble_right_req = right_weak;
+    g_players[slot].rumble_dirty = true;
     stadia_transport_wake();
+}
+
+void stadia_transport_set_rumble(uint16_t left_strong, uint16_t right_weak) {
+    stadia_transport_set_rumble_slot(0, left_strong, right_weak);
 }
 
 /* ---------- Minimal Protobuf Wire Helpers (bypasses 128B nanopb wrapper caps) ---------- */
@@ -267,7 +329,6 @@ static bool pbw_read_varint(const uint8_t *buf, size_t len, size_t *off, uint64_
     return false;
 }
 
-/* Extract the first length-delimited field matching target_field from a raw protobuf message */
 static bool pbw_find_bytes(const uint8_t *buf, size_t len, uint32_t target_field,
                            const uint8_t **out_ptr, size_t *out_len) {
     size_t off = 0;
@@ -369,7 +430,7 @@ static void handle_stun(dtls_link_t *L, const uint8_t *data, size_t len,
     sendto(L->sock, resp, off, 0, (const struct sockaddr *)peer, sizeof(*peer));
     if (!L->first_stun_logged) {
         L->first_stun_logged = true;
-        ESP_LOGI(TAG, "[%s] STUN Binding Success sent", L->name);
+        ESP_LOGI(TAG, "[P%d:%s] STUN Binding Success sent", L->slot + 1, L->name);
     }
 }
 
@@ -470,7 +531,6 @@ static bool tls_init_shared(void) {
                              (size_t)(privkey_pem_end - privkey_pem_start),
                              NULL, 0, mbedtls_ctr_drbg_random, &g_drbg) != 0) return false;
 
-    /* Precompute "sha-256 AA:BB:..." fingerprint for Game Session SDP answer */
     uint8_t hash[32];
     mbedtls_sha256(g_srv_cert.raw.p, g_srv_cert.raw.len, hash, 0);
     size_t pos = (size_t)snprintf(g_cert_fp, sizeof(g_cert_fp), "sha-256 ");
@@ -524,7 +584,7 @@ static void link_reset(dtls_link_t *L) {
     mbedtls_ssl_session_reset(&L->ssl);
     stadia_srtp_free(&L->srtp);
     mbedtls_ssl_set_export_keys_cb(&L->ssl, stadia_srtp_export_cb, &L->srtp);
-    if (L == &g_disp) {
+    if (!L->is_game && L->slot == 0) {
         g_audio_enabled = false;
         g_audio_next_tx_us = 0;
     }
@@ -595,7 +655,7 @@ static void link_send_rpc_response(dtls_link_t *L, uint16_t wire_id, uint32_t ti
     free(rpc);
 }
 
-static void send_get_controller_state_request(void) {
+static void send_get_controller_state_request(stadia_player_t *P) {
     gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
     if (!dtc) return;
     dtc->has_get_controller_state = true;
@@ -603,12 +663,12 @@ static void send_get_controller_state_request(void) {
     uint8_t buf[64];
     pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
     if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
-        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
+        link_send_rpc_request(&P->disp, WIRE_ID_RPC_DISPLAY, ++P->rpc_ticket, buf, os.bytes_written);
     }
     free(dtc);
 }
 
-static void send_start_game_request(void) {
+static void send_start_game_request(stadia_player_t *P) {
     gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
     if (!dtc) return;
     dtc->has_start_game = true;
@@ -619,14 +679,14 @@ static void send_start_game_request(void) {
     uint8_t buf[64];
     pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
     if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
-        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
-        g_start_game_sent = true;
-        ESP_LOGI(TAG, "Sent StartGame (key=%s) for rumble channel", GAME_KEY);
+        link_send_rpc_request(&P->disp, WIRE_ID_RPC_DISPLAY, ++P->rpc_ticket, buf, os.bytes_written);
+        P->start_game_sent = true;
+        ESP_LOGI(TAG, "[P%d] Sent StartGame (key=%s) for rumble channel", P->slot + 1, GAME_KEY);
     }
     free(dtc);
 }
 
-static void send_set_audio_mode(uint32_t mode, bool f3) {
+static void send_set_audio_mode(stadia_player_t *P, uint32_t mode, bool f3) {
     gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
     if (!dtc) return;
     dtc->has_set_audio_mode = true;
@@ -637,13 +697,13 @@ static void send_set_audio_mode(uint32_t mode, bool f3) {
     uint8_t buf[64];
     pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
     if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
-        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
-        ESP_LOGI(TAG, "Sent SetAudioMode(mode=%lu, f3=%d)", (unsigned long)mode, f3 ? 1 : 0);
+        link_send_rpc_request(&P->disp, WIRE_ID_RPC_DISPLAY, ++P->rpc_ticket, buf, os.bytes_written);
+        ESP_LOGI(TAG, "[P%d] Sent SetAudioMode(mode=%lu, f3=%d)", P->slot + 1, (unsigned long)mode, f3 ? 1 : 0);
     }
     free(dtc);
 }
 
-static void send_set_microphone(bool enable) {
+static void send_set_microphone(stadia_player_t *P, bool enable) {
     gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
     if (!dtc) return;
     dtc->has_set_microphone = true;
@@ -652,14 +712,16 @@ static void send_set_microphone(bool enable) {
     uint8_t buf[64];
     pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
     if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
-        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
-        ESP_LOGI(TAG, "Sent SetMicrophone(%d)", enable ? 1 : 0);
+        link_send_rpc_request(&P->disp, WIRE_ID_RPC_DISPLAY, ++P->rpc_ticket, buf, os.bytes_written);
+        ESP_LOGI(TAG, "[P%d] Sent SetMicrophone(%d)", P->slot + 1, enable ? 1 : 0);
     }
     free(dtc);
 }
 
 static void service_audio_tx(void) {
-    if (!g_audio_enabled || !g_disp.srtp.keys_ready || !g_disp.peer_seen) return;
+    dtls_link_t *disp0 = &g_players[0].disp;
+    if (usb_gamepad_get_max_players() > 1) return;
+    if (!g_audio_enabled || !disp0->srtp.keys_ready || !disp0->peer_seen) return;
 
     uint8_t opus_pkt[STADIA_MAX_OPUS_PKT_BYTES];
     size_t flen = 0;
@@ -690,20 +752,20 @@ static void service_audio_tx(void) {
         memcpy(g_audio_tx_buf + 12, opus_pkt, flen);
 
         size_t srtp_len = 0;
-        if (stadia_srtp_protect(&g_disp.srtp, g_audio_tx_buf, 12u + flen, &srtp_len)) {
-            sendto(g_disp.sock, g_audio_tx_buf, srtp_len, 0,
-                   (const struct sockaddr *)&g_disp.peer, sizeof(g_disp.peer));
+        if (stadia_srtp_protect(&disp0->srtp, g_audio_tx_buf, 12u + flen, &srtp_len)) {
+            sendto(disp0->sock, g_audio_tx_buf, srtp_len, 0,
+                   (const struct sockaddr *)&disp0->peer, sizeof(disp0->peer));
             g_audio_tx_pkts++;
         }
     }
 }
 
 /* ---------- Game Session: ProxyRequest -> ProxyResponse + Rumble TX ---------- */
-static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy_bytes, size_t proxy_len) {
-    /* ProxyRequest.body = field 4 -> inner RpcMessage request -> StreamerRequest.initialization(1).offer(2) */
+static void handle_proxy_request_raw(stadia_player_t *P, uint32_t outer_ticket,
+                                     const uint8_t *proxy_bytes, size_t proxy_len) {
     const uint8_t *body = NULL; size_t body_len = 0;
     if (!pbw_find_bytes(proxy_bytes, proxy_len, 4, &body, &body_len)) {
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
         return;
     }
 
@@ -714,7 +776,7 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
         inner_req->which_payload != gotham_rpc_RpcMessage_request_tag ||
         !inner_req->payload.request.has_payload) {
         free(inner_req);
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
         return;
     }
     uint32_t inner_ticket = inner_req->payload.request.ticket;
@@ -726,7 +788,7 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
     if (!pbw_find_bytes(sreq, sreq_len, 1, &init_req, &init_req_len) ||
         !pbw_find_bytes(init_req, init_req_len, 2, &offer_bytes, &offer_len)) {
         free(inner_req);
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, outer_ticket, gotham_rpc_StatusCode_OK, NULL, 0);
         return;
     }
 
@@ -738,20 +800,20 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
             if (offer->has_raw_dtls) raw_dtls = offer->raw_dtls;
             if (offer->has_delayed_acks) delayed_acks = offer->delayed_acks;
             if (offer->has_use_rtp_timestamps) use_rtp_ts = offer->use_rtp_timestamps;
-            snprintf(g_game.ctrl_ufrag, sizeof(g_game.ctrl_ufrag), "%.63s", offer->ice_ufrag);
-            snprintf(g_game.ctrl_pwd,   sizeof(g_game.ctrl_pwd),   "%.63s", offer->ice_password);
-            ESP_LOGI(TAG, "[GAME] Offer decoded: ufrag=%s raw_dtls=%d", g_game.ctrl_ufrag, (int)raw_dtls);
+            snprintf(P->game.ctrl_ufrag, sizeof(P->game.ctrl_ufrag), "%.63s", offer->ice_ufrag);
+            snprintf(P->game.ctrl_pwd,   sizeof(P->game.ctrl_pwd),   "%.63s", offer->ice_password);
+            ESP_LOGI(TAG, "[P%d:GAME] Offer decoded: ufrag=%s raw_dtls=%d", P->slot + 1, P->game.ctrl_ufrag, (int)raw_dtls);
         }
         free(offer);
     }
     free(inner_req);
 
-    link_reset(&g_game);
-    g_game.peer_seen = false;
-    g_game_tx_seq = 0;
-    g_game_use_rtp = false;
+    link_reset(&P->game);
+    P->game.peer_seen = false;
+    P->game_tx_seq = 0;
+    P->game_use_rtp = false;
 
-    /* Encode RtcSdpAnswer + RtcIceCandidate for Game Session (:50002) */
+    /* Encode RtcSdpAnswer + RtcIceCandidate for Game Session (:50002 + slot*4) */
     chrome_cloudcast_proto_api_common_RtcSdpAnswer *ans = calloc(1, sizeof(*ans));
     chrome_cloudcast_proto_api_common_RtcIceCandidate *cand = calloc(1, sizeof(*cand));
     uint8_t *ans_buf = malloc(512);
@@ -769,31 +831,28 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
         snprintf(ans->ice_password, sizeof(ans->ice_password), "%s", GAME_ICE_PWD);
         ans->has_fingerprint = true;
         snprintf(ans->fingerprint, sizeof(ans->fingerprint), "%s", g_cert_fp);
-        ans->has_raw_dtls = true;          ans->raw_dtls = raw_dtls;
-        ans->has_delayed_acks = true;      ans->delayed_acks = delayed_acks;
+        ans->has_raw_dtls = true;           ans->raw_dtls = raw_dtls;
+        ans->has_delayed_acks = true;       ans->delayed_acks = delayed_acks;
         ans->has_use_rtp_timestamps = true; ans->use_rtp_timestamps = use_rtp_ts;
         ans->has_disable_game_stats = true; ans->disable_game_stats = true;
         ans->has_disable_frame_tokens = true; ans->disable_frame_tokens = true;
         ans->has_network_type = true;
         ans->network_type = chrome_cloudcast_proto_api_common_RtcSdpNetworkType_NETWORK_TYPE_ETHERNET;
 
-        cand->has_sdp_mid = true;          snprintf(cand->sdp_mid, sizeof(cand->sdp_mid), "0");
-        cand->has_sdp_mline_index = true;  cand->sdp_mline_index = 0;
-        cand->has_foundation = true;       snprintf(cand->foundation, sizeof(cand->foundation), "1");
-        cand->has_priority = true;         cand->priority = (126u << 24) | (65535u << 8) | 255u;
+        cand->has_sdp_mid = true;           snprintf(cand->sdp_mid, sizeof(cand->sdp_mid), "0");
+        cand->has_sdp_mline_index = true;   cand->sdp_mline_index = 0;
+        cand->has_foundation = true;        snprintf(cand->foundation, sizeof(cand->foundation), "1");
+        cand->has_priority = true;          cand->priority = (126u << 24) | (65535u << 8) | 255u;
         cand->has_local_endpoint_ip = true; snprintf(cand->local_endpoint_ip, sizeof(cand->local_endpoint_ip), "192.168.4.1");
-        cand->has_local_endpoint_port = true; cand->local_endpoint_port = GAME_UDP_PORT;
+        cand->has_local_endpoint_port = true; cand->local_endpoint_port = STADIA_SLOT_GAME_PORT(P->slot);
 
         pb_ostream_t aos = pb_ostream_from_buffer(ans_buf, 512);
         pb_ostream_t cos = pb_ostream_from_buffer(cand_buf, 256);
         if (pb_encode(&aos, chrome_cloudcast_proto_api_common_RtcSdpAnswer_fields, ans) &&
             pb_encode(&cos, chrome_cloudcast_proto_api_common_RtcIceCandidate_fields, cand)) {
-            /* InitializationResponse { answer(1), candidate(2) } */
             size_t il = pbw_put_bytes(init_resp, 896, 1, ans_buf, aos.bytes_written);
             il += pbw_put_bytes(init_resp + il, 896 - il, 2, cand_buf, cos.bytes_written);
-            /* StreamerResponse { initialization(1) } */
             size_t sl = pbw_put_bytes(sresp, 960, 1, init_resp, il);
-            /* Inner RpcMessage response */
             inner_resp->which_payload = gotham_rpc_RpcMessage_response_tag;
             inner_resp->payload.response.has_ticket = true;
             inner_resp->payload.response.ticket = inner_ticket;
@@ -807,13 +866,13 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
 
             pb_ostream_t ros = pb_ostream_from_buffer(inner_resp_buf, 1024);
             if (pb_encode(&ros, gotham_rpc_RpcMessage_fields, inner_resp)) {
-                /* ProxyResponse { data(1) } wrapped in DisplayToController { proxy_response(1) } */
                 uint8_t pr_buf[1056];
                 size_t prl = pbw_put_bytes(pr_buf, sizeof(pr_buf), 1, inner_resp_buf, ros.bytes_written);
                 size_t dtcl = pbw_put_bytes(dtc_buf, 1088, 1, pr_buf, prl);
-                link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, outer_ticket,
+                link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, outer_ticket,
                                        gotham_rpc_StatusCode_OK, dtc_buf, dtcl);
-                ESP_LOGI(TAG, "[GAME] Sent ProxyResponse -> awaiting UDP :%d", GAME_UDP_PORT);
+                ESP_LOGI(TAG, "[P%d:GAME] Sent ProxyResponse -> awaiting UDP :%u",
+                         P->slot + 1, (unsigned)STADIA_SLOT_GAME_PORT(P->slot));
             }
         }
     }
@@ -821,63 +880,62 @@ static void handle_proxy_request_raw(uint32_t outer_ticket, const uint8_t *proxy
     free(init_resp); free(sresp); free(inner_resp_buf); free(dtc_buf); free(inner_resp);
 }
 
-static void send_game_rumble(uint16_t left, uint16_t right) {
-    if (!g_game.handshake_done) return;
-    /* InputProtocolMessage { input_message_series(7) { session_id(1), seq(2), base_ts(3), messages(4) { input_feedback_message_v2(10) { gamepad_vibration(1) { id(1), left(2), right(3) } } } } } */
+static void send_game_rumble(stadia_player_t *P, uint16_t left, uint16_t right) {
+    if (!P->game.handshake_done) return;
     uint8_t vib[32], fb[48], slim[64], series[160], ipm[180];
     size_t vl = 0;
-    if (g_game_pad_id > 0) vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 1, g_game_pad_id);
-    if (left > 0)          vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 2, left);
-    if (right > 0)         vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 3, right);
+    if (P->game_pad_id > 0) vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 1, P->game_pad_id);
+    if (left > 0)           vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 2, left);
+    if (right > 0)          vl += pbw_put_u64(vib + vl, sizeof(vib) - vl, 3, right);
     size_t fbl = pbw_put_bytes(fb, sizeof(fb), 1, vib, vl);
     size_t sll = pbw_put_bytes(slim, sizeof(slim), 10, fb, fbl);
     size_t serl = 0;
-    if (g_game_session_id[0]) {
+    if (P->game_session_id[0]) {
         serl += pbw_put_bytes(series + serl, sizeof(series) - serl, 1,
-                              (const uint8_t *)g_game_session_id, strlen(g_game_session_id));
+                              (const uint8_t *)P->game_session_id, strlen(P->game_session_id));
     }
-    serl += pbw_put_u64(series + serl, sizeof(series) - serl, 2, ++g_game_tx_seq);
+    serl += pbw_put_u64(series + serl, sizeof(series) - serl, 2, ++P->game_tx_seq);
     serl += pbw_put_u64(series + serl, sizeof(series) - serl, 3, (uint64_t)esp_timer_get_time());
     serl += pbw_put_bytes(series + serl, sizeof(series) - serl, 4, slim, sll);
     size_t ipml = pbw_put_bytes(ipm, sizeof(ipm), 7, series, serl);
 
-    if (g_game_use_rtp) {
+    if (P->game_use_rtp) {
         uint8_t rtp[12 + 180];
-        uint16_t seq = ++g_game_rtp_seq;
+        uint16_t seq = ++P->game_rtp_seq;
         rtp[0] = 0x80; rtp[1] = 96;
         rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
         memset(rtp + 4, 0, 8);
         rtp[8] = 0x53; rtp[9] = 0x54; rtp[10] = 0x41; rtp[11] = 0x44;
         memcpy(rtp + 12, ipm, ipml);
-        link_send_wire(&g_game, WIRE_ID_RTP, rtp, 12 + ipml);
+        link_send_wire(&P->game, WIRE_ID_RTP, rtp, 12 + ipml);
     } else {
-        link_send_wire(&g_game, WIRE_ID_RTP, ipm, ipml);
+        link_send_wire(&P->game, WIRE_ID_RTP, ipm, ipml);
     }
-    g_rumble_left_sent = left;
-    g_rumble_right_sent = right;
-    g_last_rumble_tx_us = esp_timer_get_time();
+    P->rumble_left_sent = left;
+    P->rumble_right_sent = right;
+    P->last_rumble_tx_us = esp_timer_get_time();
 }
 
 /* ---------- Input dispatch ---------- */
-static void dispatch_input(uint32_t buttons,
+static void dispatch_input(stadia_player_t *P, uint32_t buttons,
                            int32_t lx, int32_t ly, int32_t rx, int32_t ry,
                            uint32_t lt, uint32_t rt) {
-    if (g_last_set && buttons == g_last_buttons &&
-        lx == g_last_lx && ly == g_last_ly &&
-        rx == g_last_rx && ry == g_last_ry &&
-        lt == g_last_lt && rt == g_last_rt) {
+    if (P->last_set && buttons == P->last_buttons &&
+        lx == P->last_lx && ly == P->last_ly &&
+        rx == P->last_rx && ry == P->last_ry &&
+        lt == P->last_lt && rt == P->last_rt) {
         return;
     }
-    g_last_set = true;
-    g_last_buttons = buttons;
-    g_last_lx = lx; g_last_ly = ly;
-    g_last_rx = rx; g_last_ry = ry;
-    g_last_lt = lt; g_last_rt = rt;
-    usb_gamepad_send(buttons, lx, ly, rx, ry, lt, rt);
+    P->last_set = true;
+    P->last_buttons = buttons;
+    P->last_lx = lx; P->last_ly = ly;
+    P->last_rx = rx; P->last_ry = ry;
+    P->last_lt = lt; P->last_rt = rt;
+    usb_gamepad_send_slot(P->slot, buttons, lx, ly, rx, ry, lt, rt);
 }
 
 /* ---------- Display & Game RPC handlers ---------- */
-static void handle_get_current_time(uint32_t ticket,
+static void handle_get_current_time(stadia_player_t *P, uint32_t ticket,
                                     const gotham_display_GetCurrentTimeRequest *req) {
     gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
     if (!dtc) return;
@@ -890,17 +948,16 @@ static void handle_get_current_time(uint32_t ticket,
     uint8_t buf[64];
     pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
     if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, ticket,
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, ticket,
                                gotham_rpc_StatusCode_OK, buf, os.bytes_written);
     }
     free(dtc);
 }
 
-static void handle_disp_rpc_request(uint32_t ticket, const uint8_t *payload, size_t len) {
-    /* Intercept ProxyRequest (field 1 of ControllerToDisplay) before nanopb 128B cap */
+static void handle_disp_rpc_request(stadia_player_t *P, uint32_t ticket, const uint8_t *payload, size_t len) {
     const uint8_t *proxy = NULL; size_t proxy_len = 0;
     if (pbw_find_bytes(payload, len, 1, &proxy, &proxy_len)) {
-        handle_proxy_request_raw(ticket, proxy, proxy_len);
+        handle_proxy_request_raw(P, ticket, proxy, proxy_len);
         return;
     }
 
@@ -913,62 +970,62 @@ static void handle_disp_rpc_request(uint32_t ticket, const uint8_t *payload, siz
     }
     switch (ctd->which_variant) {
     case gotham_display_ControllerToDisplay_keepalive_tag:
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, ticket, gotham_rpc_StatusCode_OK, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, ticket, gotham_rpc_StatusCode_OK, NULL, 0);
         break;
     case gotham_display_ControllerToDisplay_get_current_time_tag:
-        handle_get_current_time(ticket, &ctd->variant.get_current_time);
+        handle_get_current_time(P, ticket, &ctd->variant.get_current_time);
         break;
     case gotham_display_ControllerToDisplay_disconnect_tag:
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, ticket, gotham_rpc_StatusCode_OK, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, ticket, gotham_rpc_StatusCode_OK, NULL, 0);
         break;
     default:
-        link_send_rpc_response(&g_disp, WIRE_ID_RPC_DISPLAY, ticket, 12 /* UNIMPLEMENTED */, NULL, 0);
+        link_send_rpc_response(&P->disp, WIRE_ID_RPC_DISPLAY, ticket, 12 /* UNIMPLEMENTED */, NULL, 0);
         break;
     }
     free(ctd);
 }
 
-static void handle_battery_float(float raw, const char *src) {
+static void handle_battery_float(stadia_player_t *P, float raw, const char *src) {
     if (isnan(raw)) return;
     if (raw < 0.0f) raw = 0.0f;
     if (raw > 1.0f) raw = 1.0f;
     int pct = (int)lroundf(raw * 100.0f);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
-    if (pct != g_battery_pct) {
-        g_battery_pct = pct;
-        ESP_LOGI(TAG, "Controller battery (%s): %d%%", src, pct);
-        usb_gamepad_set_battery(pct);
+    if (pct != P->battery_pct) {
+        P->battery_pct = pct;
+        ESP_LOGI(TAG, "[P%d] Controller battery (%s): %d%%", P->slot + 1, src, pct);
+        usb_gamepad_set_battery_slot(P->slot, pct);
     }
-    if (pct > 10) g_batt_warn_5 = false;
-    if (pct > 20) g_batt_warn_15 = false;
+    if (pct > 10) P->batt_warn_5 = false;
+    if (pct > 20) P->batt_warn_15 = false;
 }
 
-static void handle_disp_rpc_notification(const uint8_t *payload, size_t len) {
+static void handle_disp_rpc_notification(stadia_player_t *P, const uint8_t *payload, size_t len) {
     gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(*ctd));
     if (!ctd) return;
     pb_istream_t is = pb_istream_from_buffer(payload, len);
     if (pb_decode(&is, gotham_display_ControllerToDisplay_fields, ctd)) {
         if (ctd->which_variant == gotham_display_ControllerToDisplay_message3_tag) {
             const gotham_display_Message3 *m = &ctd->variant.message3;
-            dispatch_input(m->f1, m->f2, m->f3, m->f4, m->f5, m->f6, m->f7);
+            dispatch_input(P, m->f1, m->f2, m->f3, m->f4, m->f5, m->f6, m->f7);
         } else if (ctd->which_variant == gotham_display_ControllerToDisplay_notification10_tag &&
                    ctd->variant.notification10.has_value) {
-            handle_battery_float(ctd->variant.notification10.value, "notif10");
+            handle_battery_float(P, ctd->variant.notification10.value, "notif10");
         } else if (ctd->which_variant == gotham_display_ControllerToDisplay_audio_configuration_changed_tag &&
                    ctd->variant.audio_configuration_changed.has_mode) {
             uint32_t m = ctd->variant.audio_configuration_changed.mode;
             if (m == 0 || m == 1) {
-                g_headset_plugged = (m == 1);
-                usb_gamepad_set_headset(g_headset_plugged);
-                ESP_LOGI(TAG, "3.5mm headset %s", g_headset_plugged ? "PLUGGED IN" : "UNPLUGGED");
+                P->headset_plugged = (m == 1);
+                if (P->slot == 0) usb_gamepad_set_headset(P->headset_plugged);
+                ESP_LOGI(TAG, "[P%d] 3.5mm headset %s", P->slot + 1, P->headset_plugged ? "PLUGGED IN" : "UNPLUGGED");
             }
         }
     }
     free(ctd);
 }
 
-static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
+static void handle_disp_rpc_response(stadia_player_t *P, const gotham_rpc_RpcResponse *resp) {
     if (!resp->has_payload || resp->payload.size == 0) return;
     gotham_display_ControllerToDisplay *ctd = calloc(1, sizeof(*ctd));
     if (!ctd) return;
@@ -977,25 +1034,25 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
         ctd->which_variant == gotham_display_ControllerToDisplay_controller_state_tag) {
         const gotham_display_GetControllerStateResponse *cs = &ctd->variant.controller_state;
         if (cs->has_f4) {
-            g_headset_plugged = cs->f4;
-            usb_gamepad_set_headset(g_headset_plugged);
+            P->headset_plugged = cs->f4;
+            if (P->slot == 0) usb_gamepad_set_headset(P->headset_plugged);
         }
         if (cs->has_f10) {
             float f10_val = 0.0f;
             memcpy(&f10_val, &cs->f10, sizeof(f10_val));
-            ESP_LOGI(TAG, "ControllerState f10=0x%08lx (%.4f) f11=%lu",
-                     (unsigned long)cs->f10, (double)f10_val,
+            ESP_LOGI(TAG, "[P%d] ControllerState f10=0x%08lx (%.4f) f11=%lu",
+                     P->slot + 1, (unsigned long)cs->f10, (double)f10_val,
                      (unsigned long)(cs->has_f11 ? cs->f11 : 0));
             if (!isnan(f10_val) && f10_val >= 0.005f && f10_val <= 1.0f) {
-                handle_battery_float(f10_val, "state_f10");
+                handle_battery_float(P, f10_val, "state_f10");
             }
         }
-        g_rpc_ready = true;
-        ESP_LOGI(TAG, "===== READY! Starting game session for rumble =====");
-        if (!g_start_game_sent) send_start_game_request();
-        if (!g_audio_enabled) {
-            send_set_audio_mode(2, true);
-            send_set_microphone(true);
+        P->rpc_ready = true;
+        ESP_LOGI(TAG, "[P%d] ===== READY! Starting game session for rumble =====", P->slot + 1);
+        if (!P->start_game_sent) send_start_game_request(P);
+        if (P->slot == 0 && usb_gamepad_get_max_players() == 1 && !g_audio_enabled) {
+            send_set_audio_mode(P, 2, true);
+            send_set_microphone(P, true);
             g_audio_enabled = true;
             g_audio_next_tx_us = 0;
         }
@@ -1004,6 +1061,7 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
 }
 
 static void handle_rpc(dtls_link_t *L, uint16_t rx_wire_id, const uint8_t *data, size_t len) {
+    stadia_player_t *P = &g_players[L->slot];
     gotham_rpc_RpcMessage *rpc = calloc(1, sizeof(*rpc));
     if (!rpc) return;
     pb_istream_t is = pb_istream_from_buffer(data, len);
@@ -1011,10 +1069,9 @@ static void handle_rpc(dtls_link_t *L, uint16_t rx_wire_id, const uint8_t *data,
         free(rpc);
         return;
     }
-    if (L == &g_game) {
-        /* Game session RPCs: answer requests with empty OK on the same wire id */
+    if (L->is_game) {
         if (rpc->which_payload == gotham_rpc_RpcMessage_request_tag) {
-            link_send_rpc_response(&g_game, rx_wire_id, rpc->payload.request.ticket,
+            link_send_rpc_response(&P->game, rx_wire_id, rpc->payload.request.ticket,
                                    gotham_rpc_StatusCode_OK, NULL, 0);
         }
         free(rpc);
@@ -1023,19 +1080,19 @@ static void handle_rpc(dtls_link_t *L, uint16_t rx_wire_id, const uint8_t *data,
     switch (rpc->which_payload) {
     case gotham_rpc_RpcMessage_request_tag:
         if (rpc->payload.request.has_payload) {
-            handle_disp_rpc_request(rpc->payload.request.ticket,
+            handle_disp_rpc_request(P, rpc->payload.request.ticket,
                                     rpc->payload.request.payload.bytes,
                                     rpc->payload.request.payload.size);
         }
         break;
     case gotham_rpc_RpcMessage_notification_tag:
         if (rpc->payload.notification.has_payload) {
-            handle_disp_rpc_notification(rpc->payload.notification.payload.bytes,
+            handle_disp_rpc_notification(P, rpc->payload.notification.payload.bytes,
                                          rpc->payload.notification.payload.size);
         }
         break;
     case gotham_rpc_RpcMessage_response_tag:
-        handle_disp_rpc_response(&rpc->payload.response);
+        handle_disp_rpc_response(P, &rpc->payload.response);
         break;
     default:
         break;
@@ -1093,7 +1150,7 @@ static bool parse_gamepad_v2_fast(const uint8_t *buf, size_t len, fast_gamepad_v
             case 6:  out->ry = pbw_zigzag32((uint32_t)v); break;
             case 7:  out->lt = (uint32_t)v; break;
             case 8:  out->rt = (uint32_t)v; break;
-            case 16: if (v != 0) out->is_reg = true; break; /* device_presence */
+            case 16: if (v != 0) out->is_reg = true; break;
             default: break;
             }
         } else if (wt == 1) {
@@ -1102,7 +1159,7 @@ static bool parse_gamepad_v2_fast(const uint8_t *buf, size_t len, fast_gamepad_v
         } else if (wt == 2) {
             uint64_t flen = 0;
             if (!pbw_read_varint(buf, len, &off, &flen) || off + flen > len) return false;
-            if (fn == 18) out->is_reg = true; /* registration_info */
+            if (fn == 18) out->is_reg = true;
             off += (size_t)flen;
         } else if (wt == 5) {
             if (off + 4 > len) return false;
@@ -1115,6 +1172,7 @@ static bool parse_gamepad_v2_fast(const uint8_t *buf, size_t len, fast_gamepad_v
 }
 
 static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len) {
+    stadia_player_t *P = &g_players[L->slot];
     const uint8_t *pb_data = payload;
     size_t pb_len = len;
     bool was_rtp = false;
@@ -1128,7 +1186,6 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         was_rtp = true;
     }
 
-    /* Field 7 of InputProtocolMessage = input_message_series */
     const uint8_t *ser = NULL;
     size_t ser_len = 0;
     if (!pbw_find_bytes(pb_data, pb_len, 7, &ser, &ser_len)) {
@@ -1136,7 +1193,7 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         was_rtp = false;
     }
 
-    if (L == &g_game) g_game_use_rtp = was_rtp;
+    if (L->is_game) P->game_use_rtp = was_rtp;
 
     uint64_t seq_num = 0;
     fast_gamepad_v2_t latest_g = {0};
@@ -1151,7 +1208,7 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         if (wt == 0) {
             uint64_t v = 0;
             if (!pbw_read_varint(ser, ser_len, &off, &v)) break;
-            if (fn == 2) seq_num = v; /* sequence_number */
+            if (fn == 2) seq_num = v;
         } else if (wt == 1) {
             if (off + 8 > ser_len) break;
             off += 8;
@@ -1160,19 +1217,17 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
             if (!pbw_read_varint(ser, ser_len, &off, &flen) || off + flen > ser_len) break;
             const uint8_t *fptr = ser + off;
             off += (size_t)flen;
-            if (fn == 1 && L == &g_game && flen > 0) {
-                /* session_id */
-                size_t cpy = flen < sizeof(g_game_session_id) - 1 ? (size_t)flen : sizeof(g_game_session_id) - 1;
-                memcpy(g_game_session_id, fptr, cpy);
-                g_game_session_id[cpy] = '\0';
+            if (fn == 1 && L->is_game && flen > 0) {
+                size_t cpy = flen < sizeof(P->game_session_id) - 1 ? (size_t)flen : sizeof(P->game_session_id) - 1;
+                memcpy(P->game_session_id, fptr, cpy);
+                P->game_session_id[cpy] = '\0';
             } else if (fn == 4) {
-                /* InputMessageSlim -> field 5 = gamepad_message_v2 */
                 const uint8_t *gp = NULL;
                 size_t gp_len = 0;
                 if (pbw_find_bytes(fptr, (size_t)flen, 5, &gp, &gp_len)) {
                     fast_gamepad_v2_t g;
                     if (parse_gamepad_v2_fast(gp, gp_len, &g)) {
-                        if (g.id > 0) g_game_pad_id = g.id;
+                        if (g.id > 0) P->game_pad_id = g.id;
                         if (!g.is_reg) {
                             latest_g = g;
                             have_g = true;
@@ -1189,16 +1244,15 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
     }
 
     if (have_g) {
-        dispatch_input(latest_g.buttons, latest_g.lx, latest_g.ly,
+        dispatch_input(P, latest_g.buttons, latest_g.lx, latest_g.ly,
                        latest_g.rx, latest_g.ry, latest_g.lt, latest_g.rt);
     }
 
-    /* Ack sequence_number (field 4 = ack_sequence_number in InputProtocolMessage) */
     uint8_t ack[16];
     size_t al = pbw_put_u64(ack, sizeof(ack), 4, seq_num);
     if (was_rtp) {
         uint8_t rtp[12 + 16];
-        uint16_t seq = ++g_game_rtp_seq;
+        uint16_t seq = ++P->game_rtp_seq;
         rtp[0] = 0x80; rtp[1] = 96;
         rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
         memset(rtp + 4, 0, 8);
@@ -1216,7 +1270,7 @@ static void handle_app_data(dtls_link_t *L, const uint8_t *data, size_t len) {
     if (total != len) return;
 
     if (id == WIRE_ID_RPC_CONTROLLER || id == WIRE_ID_RPC_DISPLAY ||
-        (L == &g_game && id == WIRE_ID_RPC_GAME)) {
+        (L->is_game && id == WIRE_ID_RPC_GAME)) {
         handle_rpc(L, id, data + WIRE_HDR_LEN, len - WIRE_HDR_LEN);
     } else if (id == WIRE_ID_RTP) {
         handle_0x66_input(L, data + WIRE_HDR_LEN, len - WIRE_HDR_LEN);
@@ -1224,19 +1278,20 @@ static void handle_app_data(dtls_link_t *L, const uint8_t *data, size_t len) {
 }
 
 static void pump_dtls(dtls_link_t *L) {
+    stadia_player_t *P = &g_players[L->slot];
     if (!L->handshake_done) {
         int rc = mbedtls_ssl_handshake(&L->ssl);
         if (rc == 0) {
             L->handshake_done = true;
             L->dtls_done_us = esp_timer_get_time();
-            if (L == &g_disp) {
-                g_rpc_ready = false;
-                g_start_game_sent = false;
-                g_last_state_req_us = 0;
+            if (!L->is_game) {
+                P->rpc_ready = false;
+                P->start_game_sent = false;
+                P->last_state_req_us = 0;
             } else {
-                g_rumble_dirty = true;
+                P->rumble_dirty = true;
             }
-            ESP_LOGI(TAG, "[%s] DTLS handshake complete!", L->name);
+            ESP_LOGI(TAG, "[P%d:%s] DTLS handshake complete!", L->slot + 1, L->name);
         } else if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
             link_reset(L);
         }
@@ -1251,18 +1306,18 @@ static void pump_dtls(dtls_link_t *L) {
         }
         if (r == MBEDTLS_ERR_SSL_WANT_READ || r == MBEDTLS_ERR_SSL_WANT_WRITE) break;
         link_reset(L);
-        if (L == &g_disp) {
-            g_rpc_ready = false;
-            g_start_game_sent = false;
-            g_last_set = false;
-            g_battery_pct = -1;
-            g_batt_warn_15 = false;
-            g_batt_warn_5 = false;
-            g_headset_plugged = false;
-            usb_gamepad_set_headset(false);
-            usb_gamepad_set_battery(-1);
-            usb_gamepad_reset();
-            link_reset(&g_game);
+        if (!L->is_game) {
+            P->rpc_ready = false;
+            P->start_game_sent = false;
+            P->last_set = false;
+            P->battery_pct = -1;
+            P->batt_warn_15 = false;
+            P->batt_warn_5 = false;
+            P->headset_plugged = false;
+            if (P->slot == 0) usb_gamepad_set_headset(false);
+            usb_gamepad_set_battery_slot(P->slot, -1);
+            usb_gamepad_reset_slot(P->slot);
+            link_reset(&P->game);
         }
         break;
     }
@@ -1295,9 +1350,10 @@ static void service_socket(dtls_link_t *L) {
             memcpy(L->rx_buf, g_udp_buf, (size_t)n);
             L->rx_len = (size_t)n;
             pump_dtls(L);
-        } else if (b0 >= 128 && b0 <= 191 && L == &g_disp && L->srtp.keys_ready) {
+        } else if (b0 >= 128 && b0 <= 191 && !L->is_game && L->slot == 0 &&
+                   usb_gamepad_get_max_players() == 1 && L->srtp.keys_ready) {
             uint8_t pt = g_udp_buf[1] & 0x7Fu;
-            if (pt < 64 || pt > 95) { /* RTP (skip RTCP 72..76) */
+            if (pt < 64 || pt > 95) {
                 size_t rtp_len = 0;
                 if (stadia_srtp_unprotect(&L->srtp, g_udp_buf, (size_t)n, &rtp_len) &&
                     rtp_len > 12 && pt == 111) {
@@ -1351,161 +1407,190 @@ static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool l
     static int s_last_level = -1;
     bool on;
     if (combo_held) {
-        on = ((now_us / 100000) & 1) == 0; /* Fast 100ms blink while holding mode combo */
+        on = ((now_us / 100000) & 1) == 0;
     } else if (!ready) {
-        on = (now_us % 1000000) < 100000;  /* Slow heartbeat: 100ms ON / 900ms OFF */
+        on = (now_us % 1000000) < 100000;
     } else if (mic_muted) {
-        on = ((now_us / 500000) & 1) == 0; /* 500ms blink when connected & mic muted */
+        on = ((now_us / 500000) & 1) == 0;
     } else if (low_batt) {
-        int64_t t = now_us % 2000000;      /* Double-dip OFF every 2s when battery <= 15% */
+        int64_t t = now_us % 2000000;
         on = !((t < 120000) || (t >= 240000 && t < 360000));
     } else {
-        on = true;                         /* Solid ON when connected & mic active */
+        on = true;
     }
-    int level = on ? 0 : 1; /* Active-LOW */
+    int level = on ? 0 : 1;
     if (level != s_last_level) {
         gpio_set_level(STATUS_LED_GPIO, level);
         s_last_level = level;
     }
 }
 
-/* Non-blocking local haptic pulse overlay (never blocks UDP/audio/input) */
-static int      s_haptic_pulses_left = 0;
-static bool     s_haptic_on = false;
-static uint16_t s_haptic_strength = 0;
-static int64_t  s_haptic_next_us = 0;
-
-static void haptic_start(int pulses, uint16_t strength) {
-    if (pulses <= 0 || !g_game.handshake_done) return;
-    s_haptic_pulses_left = pulses;
-    s_haptic_strength = strength;
-    s_haptic_on = true;
-    s_haptic_next_us = esp_timer_get_time() + 75000; /* 75 ms ON */
-    send_game_rumble(strength, strength);
+static void haptic_start(stadia_player_t *P, int pulses, uint16_t strength) {
+    if (pulses <= 0 || !P->game.handshake_done) return;
+    P->haptic_pulses_left = pulses;
+    P->haptic_strength = strength;
+    P->haptic_on = true;
+    P->haptic_next_us = esp_timer_get_time() + 75000;
+    send_game_rumble(P, strength, strength);
 }
 
-static void haptic_tick(int64_t now_us) {
-    if (s_haptic_pulses_left <= 0) return;
-    if (now_us < s_haptic_next_us) return;
-    if (s_haptic_on) {
-        s_haptic_on = false;
-        s_haptic_pulses_left--;
-        if (g_game.handshake_done) send_game_rumble(0, 0);
-        if (s_haptic_pulses_left > 0) {
-            s_haptic_next_us = now_us + 75000; /* 75 ms gap */
+static void haptic_tick(stadia_player_t *P, int64_t now_us) {
+    if (P->haptic_pulses_left <= 0) return;
+    if (now_us < P->haptic_next_us) return;
+    if (P->haptic_on) {
+        P->haptic_on = false;
+        P->haptic_pulses_left--;
+        if (P->game.handshake_done) send_game_rumble(P, 0, 0);
+        if (P->haptic_pulses_left > 0) {
+            P->haptic_next_us = now_us + 75000;
         } else {
-            g_rumble_dirty = true; /* Restore host rumble state */
+            P->rumble_dirty = true;
         }
     } else {
-        s_haptic_on = true;
-        s_haptic_next_us = now_us + 75000;
-        if (g_game.handshake_done) send_game_rumble(s_haptic_strength, s_haptic_strength);
+        P->haptic_on = true;
+        P->haptic_next_us = now_us + 75000;
+        if (P->game.handshake_done) send_game_rumble(P, P->haptic_strength, P->haptic_strength);
     }
 }
 
 static void stadia_transport_task(void *arg) {
     status_led_init();
-    stadia_opus_init();
+    int max_p = (int)usb_gamepad_get_max_players();
+    if (max_p < 1) max_p = 1;
+    if (max_p > STADIA_MAX_PLAYERS) max_p = STADIA_MAX_PLAYERS;
+    if (max_p == 1) {
+        stadia_opus_init();
+    }
     (void)arg;
     g_wake_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (!tls_init_shared() || !link_init(&g_disp) || !link_init(&g_game)) {
-        ESP_LOGE(TAG, "Transport init failed");
+    if (!tls_init_shared()) {
+        ESP_LOGE(TAG, "TLS shared init failed");
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "UDP STUN/DTLS listening on :%d (display) and :%d (game/rumble)",
-             DISP_UDP_PORT, GAME_UDP_PORT);
 
-    int maxfd = (g_disp.sock > g_game.sock ? g_disp.sock : g_game.sock) + 1;
+    int maxfd = -1;
+    for (int slot = 0; slot < max_p; slot++) {
+        stadia_player_t *P = &g_players[slot];
+        memset(P, 0, sizeof(*P));
+        P->slot = slot;
+        P->battery_pct = -1;
+
+        P->disp.name = "DISP";
+        P->disp.slot = slot;
+        P->disp.is_game = false;
+        P->disp.local_port = STADIA_SLOT_DISP_PORT(slot);
+        P->disp.our_ufrag = DISP_ICE_UFRAG;
+        P->disp.our_pwd = DISP_ICE_PWD;
+        P->disp.sock = -1;
+
+        P->game.name = "GAME";
+        P->game.slot = slot;
+        P->game.is_game = true;
+        P->game.local_port = STADIA_SLOT_GAME_PORT(slot);
+        P->game.our_ufrag = GAME_ICE_UFRAG;
+        P->game.our_pwd = GAME_ICE_PWD;
+        P->game.sock = -1;
+
+        if (!link_init(&P->disp) || !link_init(&P->game)) {
+            ESP_LOGE(TAG, "[P%d] Transport link_init failed", slot + 1);
+            vTaskDelete(NULL);
+            return;
+        }
+        if (P->disp.sock > maxfd) maxfd = P->disp.sock;
+        if (P->game.sock > maxfd) maxfd = P->game.sock;
+        ESP_LOGI(TAG, "[P%d] UDP STUN/DTLS listening on :%u (display) and :%u (game/rumble)",
+                 slot + 1, (unsigned)P->disp.local_port, (unsigned)P->game.local_port);
+    }
+
     for (;;) {
-        if (g_remote_updated) {
-            g_remote_updated = false;
-            link_reset(&g_disp);
-            link_reset(&g_game);
-            g_rpc_ready = false;
-            g_start_game_sent = false;
-            g_last_set = false;
-            g_battery_pct = -1;
-            g_batt_warn_15 = false;
-            g_batt_warn_5 = false;
-            g_headset_plugged = false;
-            usb_gamepad_set_headset(false);
-            usb_gamepad_set_battery(-1);
-            usb_gamepad_reset();
-            snprintf(g_disp.ctrl_ufrag, sizeof(g_disp.ctrl_ufrag), "%s", g_pending_ufrag);
-            snprintf(g_disp.ctrl_pwd,   sizeof(g_disp.ctrl_pwd),   "%s", g_pending_pwd);
-            if (g_pending_cand_valid) {
-                g_disp.peer = g_pending_cand;
-                g_disp.peer_seen = true;
+        for (int slot = 0; slot < max_p; slot++) {
+            stadia_player_t *P = &g_players[slot];
+            if (P->remote_updated) {
+                P->remote_updated = false;
+                link_reset(&P->disp);
+                link_reset(&P->game);
+                P->rpc_ready = false;
+                P->start_game_sent = false;
+                P->last_set = false;
+                P->battery_pct = -1;
+                P->batt_warn_15 = false;
+                P->batt_warn_5 = false;
+                P->headset_plugged = false;
+                if (slot == 0) usb_gamepad_set_headset(false);
+                usb_gamepad_set_battery_slot(slot, -1);
+                usb_gamepad_reset_slot(slot);
+                snprintf(P->disp.ctrl_ufrag, sizeof(P->disp.ctrl_ufrag), "%s", P->pending_ufrag);
+                snprintf(P->disp.ctrl_pwd,   sizeof(P->disp.ctrl_pwd),   "%s", P->pending_pwd);
+                if (P->pending_cand_valid) {
+                    P->disp.peer = P->pending_cand;
+                    P->disp.peer_seen = true;
+                }
             }
         }
 
         fd_set rfds;
         FD_ZERO(&rfds);
-        FD_SET(g_disp.sock, &rfds);
-        FD_SET(g_game.sock, &rfds);
-        /* Event-driven: wakes instantly via UDP RX or g_wake_sock; tighter 15ms tick while connecting */
-        struct timeval tv = { .tv_sec = 0, .tv_usec = g_rpc_ready ? 50000 : 15000 };
-        int r = select(maxfd, &rfds, NULL, NULL, &tv);
+        bool any_connecting = false;
+        for (int slot = 0; slot < max_p; slot++) {
+            stadia_player_t *P = &g_players[slot];
+            FD_SET(P->disp.sock, &rfds);
+            FD_SET(P->game.sock, &rfds);
+            if (!P->rpc_ready) any_connecting = true;
+        }
+        struct timeval tv = { .tv_sec = 0, .tv_usec = any_connecting ? 15000 : 50000 };
+        int r = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (r > 0) {
-            if (FD_ISSET(g_disp.sock, &rfds)) service_socket(&g_disp);
-            if (FD_ISSET(g_game.sock, &rfds)) service_socket(&g_game);
-        }
-
-        service_timers(&g_disp);
-        service_timers(&g_game);
-
-        /* Display RPC handshake: 40ms after DTLS, retry every 200ms until READY */
-        if (g_disp.handshake_done && !g_rpc_ready) {
-            int64_t now = esp_timer_get_time();
-            if ((now - g_disp.dtls_done_us) >= 40000 &&
-                (g_last_state_req_us == 0 || (now - g_last_state_req_us) >= 200000)) {
-                g_last_state_req_us = now;
-                send_get_controller_state_request();
+            for (int slot = 0; slot < max_p; slot++) {
+                stadia_player_t *P = &g_players[slot];
+                if (FD_ISSET(P->disp.sock, &rfds)) service_socket(&P->disp);
+                if (FD_ISSET(P->game.sock, &rfds)) service_socket(&P->game);
             }
         }
 
-        /* Game session rumble: non-blocking haptic overlay or host rumble */
-        {
-            int64_t now_r = esp_timer_get_time();
-            haptic_tick(now_r);
-            if (g_game.handshake_done && s_haptic_pulses_left <= 0 && g_battery_pct >= 0) {
-                if (g_battery_pct <= 5 && !g_batt_warn_5) {
-                    g_batt_warn_5 = true;
-                    g_batt_warn_15 = true;
-                    ESP_LOGW(TAG, "Controller battery CRITICAL (%d%%)", g_battery_pct);
-                    haptic_start(5, 0xA000);
-                } else if (g_battery_pct <= 15 && !g_batt_warn_15) {
-                    g_batt_warn_15 = true;
-                    ESP_LOGW(TAG, "Controller battery LOW (%d%%)", g_battery_pct);
-                    haptic_start(3, 0x8000);
+        int64_t now = esp_timer_get_time();
+        bool any_ready = false;
+        bool any_low_batt = false;
+        bool any_combo_held = false;
+
+        for (int slot = 0; slot < max_p; slot++) {
+            stadia_player_t *P = &g_players[slot];
+            service_timers(&P->disp);
+            service_timers(&P->game);
+
+            if (P->disp.handshake_done && !P->rpc_ready) {
+                if ((now - P->disp.dtls_done_us) >= 40000 &&
+                    (P->last_state_req_us == 0 || (now - P->last_state_req_us) >= 200000)) {
+                    P->last_state_req_us = now;
+                    send_get_controller_state_request(P);
                 }
             }
-            if (g_game.handshake_done && s_haptic_pulses_left <= 0) {
-                uint16_t rl = g_rumble_left_req;
-                uint16_t rr = g_rumble_right_req;
-                bool changed = g_rumble_dirty || rl != g_rumble_left_sent || rr != g_rumble_right_sent;
-                bool refresh = (rl > 0 || rr > 0) && ((now_r - g_last_rumble_tx_us) >= 2000000);
+
+            haptic_tick(P, now);
+            if (P->game.handshake_done && P->haptic_pulses_left <= 0 && P->battery_pct >= 0) {
+                if (P->battery_pct <= 5 && !P->batt_warn_5) {
+                    P->batt_warn_5 = true;
+                    P->batt_warn_15 = true;
+                    ESP_LOGW(TAG, "[P%d] Controller battery CRITICAL (%d%%)", slot + 1, P->battery_pct);
+                    haptic_start(P, 5, 0xA000);
+                } else if (P->battery_pct <= 15 && !P->batt_warn_15) {
+                    P->batt_warn_15 = true;
+                    ESP_LOGW(TAG, "[P%d] Controller battery LOW (%d%%)", slot + 1, P->battery_pct);
+                    haptic_start(P, 3, 0x8000);
+                }
+            }
+            if (P->game.handshake_done && P->haptic_pulses_left <= 0) {
+                uint16_t rl = P->rumble_left_req;
+                uint16_t rr = P->rumble_right_req;
+                bool changed = P->rumble_dirty || rl != P->rumble_left_sent || rr != P->rumble_right_sent;
+                bool refresh = (rl > 0 || rr > 0) && ((now - P->last_rumble_tx_us) >= 2000000);
                 if (changed || refresh) {
-                    g_rumble_dirty = false;
-                    send_game_rumble(rl, rr);
+                    P->rumble_dirty = false;
+                    send_game_rumble(P, rl, rr);
                 }
             }
-        }
 
-        /* Controller hotkeys & mode switching:
-         *   Hold 2s: Assistant + Capture + A       -> Stadia HID    (1 buzz, reboot)
-         *   Hold 2s: Assistant + Capture + X       -> XInput        (2 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + L1      -> DualShock 4   (2 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + R1      -> Switch Pro    (3 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + Options -> PS3 (DS3)     (4 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + B       -> Home Wi-Fi / LAN Auto-OTA (3 buzzes, reboot)
-         *   Hold 2s: Assistant + Capture + Y       -> USB ROM Bootloader Mode   (4 buzzes, reboot)
-         *   Tap:     Assistant (XInput/DS4 mode) OR Assistant + Capture (any mode) -> Mic mute toggle
-         *   Tap:     Assistant + Capture + D-Pad Up / Down  -> Mic gain 1.0x / 1.5x / 2.0x / 2.5x
-         *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8%
-         *   Tap:     Assistant + Capture + D-Pad Left       -> Battery check (1-4 buzzes = quartile; soft buzz = unknown) */
-        {
+            /* Controller hotkeys & mode switching (per player) */
             const uint32_t btn_up     = (1u << 0);
             const uint32_t btn_down   = (1u << 1);
             const uint32_t btn_left   = (1u << 2);
@@ -1529,44 +1614,33 @@ static void stadia_transport_task(void *arg) {
             const uint32_t combo_ota    = combo_base | btn_b;
             const uint32_t combo_boot   = combo_base | btn_y;
 
-            static int64_t  s_combo_start_us = 0;
-            static uint32_t s_combo_active = 0;
-            static uint32_t s_prev_btn = 0;
-            static int64_t  s_asst_down_us = 0;
-            static bool     s_asst_chord_used = false;
-            static bool     s_both_down = false;
+            uint32_t cur = P->last_set ? P->last_buttons : 0;
+            uint32_t rising = cur & ~P->prev_btn;
 
-            int64_t now = esp_timer_get_time();
-            uint32_t cur = g_last_set ? g_last_buttons : 0;
-            uint32_t rising = cur & ~s_prev_btn;
-
-            /* Track Assistant press lifecycle so holding combos never triggers a mute tap */
             if (cur & btn_asst) {
-                if (!(s_prev_btn & btn_asst)) {
-                    s_asst_down_us = now;
-                    s_asst_chord_used = false;
-                    s_both_down = false;
+                if (!(P->prev_btn & btn_asst)) {
+                    P->asst_down_us = now;
+                    P->asst_chord_used = false;
+                    P->both_down = false;
                 }
-                if (cur & btn_cap) s_both_down = true;
-                if (cur & ~(btn_asst | btn_cap)) s_asst_chord_used = true;
-            } else if (s_prev_btn & btn_asst) {
-                /* Assistant released: quick tap (<600ms) with no other action button = mic mute toggle */
+                if (cur & btn_cap) P->both_down = true;
+                if (cur & ~(btn_asst | btn_cap)) P->asst_chord_used = true;
+            } else if (P->prev_btn & btn_asst) {
                 usb_gamepad_mode_t cur_mode = usb_gamepad_get_mode();
-                bool allow_mute = s_both_down || (cur_mode == USB_GAMEPAD_MODE_XINPUT || cur_mode == USB_GAMEPAD_MODE_DS4);
-                if (allow_mute && !s_asst_chord_used && (now - s_asst_down_us) < 600000) {
+                bool allow_mute = P->both_down || (cur_mode == USB_GAMEPAD_MODE_XINPUT || cur_mode == USB_GAMEPAD_MODE_DS4);
+                if (allow_mute && !P->asst_chord_used && (now - P->asst_down_us) < 600000) {
                     bool muted = !usb_audio_is_mic_muted();
                     usb_audio_set_mic_muted(muted);
                     ESP_LOGI(TAG, "Mic %s", muted ? "MUTED" : "UNMUTED");
-                    haptic_start(muted ? 1 : 2, muted ? 0x6000 : 0x9000);
+                    haptic_start(P, muted ? 1 : 2, muted ? 0x6000 : 0x9000);
                 }
-                s_both_down = false;
-                s_asst_chord_used = false;
+                P->both_down = false;
+                P->asst_chord_used = false;
             }
 
-            /* Instant combo taps while holding Assistant + Capture */
             if ((cur & combo_base) == combo_base) {
                 if (rising & (btn_up | btn_down)) {
-                    static const uint16_t k_gains[] = { 256, 384, 512, 640 }; /* 1.0x, 1.5x, 2.0x, 2.5x */
+                    static const uint16_t k_gains[] = { 256, 384, 512, 640 };
                     uint16_t g = stadia_opus_get_mic_gain_q8();
                     int idx = 0;
                     for (int i = 0; i < 4; i++) {
@@ -1576,32 +1650,31 @@ static void stadia_transport_task(void *arg) {
                     else if ((rising & btn_down) && idx > 0) idx--;
                     stadia_opus_set_mic_gain_q8(k_gains[idx]);
                     ESP_LOGI(TAG, "Mic gain -> %u.%ux", k_gains[idx] / 256u, ((k_gains[idx] % 256u) * 10u) / 256u);
-                    haptic_start(idx + 1, 0x7000);
-                    s_asst_chord_used = true;
+                    haptic_start(P, idx + 1, 0x7000);
+                    P->asst_chord_used = true;
                 } else if (rising & btn_right) {
-                    static const uint16_t k_dz[] = { 0, 1310, 2621 }; /* 0%, 4%, 8% */
+                    static const uint16_t k_dz[] = { 0, 1310, 2621 };
                     uint16_t dz = usb_gamepad_get_deadzone();
                     int idx = (dz == 0) ? 1 : (dz <= 1310 ? 2 : 0);
                     usb_gamepad_set_deadzone(k_dz[idx]);
                     ESP_LOGI(TAG, "Stick deadzone -> %u%%", (unsigned)(idx * 4));
-                    haptic_start(idx + 1, 0x7000);
-                    s_asst_chord_used = true;
+                    haptic_start(P, idx + 1, 0x7000);
+                    P->asst_chord_used = true;
                 } else if (rising & btn_left) {
-                    if (g_battery_pct < 0) {
-                        ESP_LOGI(TAG, "Battery check: unknown (waiting for controller gauge)");
-                        haptic_start(1, 0x3500);
+                    if (P->battery_pct < 0) {
+                        ESP_LOGI(TAG, "[P%d] Battery check: unknown (waiting for controller gauge)", slot + 1);
+                        haptic_start(P, 1, 0x3500);
                     } else {
-                        int pulses = (g_battery_pct >= 76) ? 4 :
-                                     (g_battery_pct >= 51) ? 3 :
-                                     (g_battery_pct >= 26) ? 2 : 1;
-                        ESP_LOGI(TAG, "Battery check: %d%% (%d pulses)", g_battery_pct, pulses);
-                        haptic_start(pulses, 0x8000);
+                        int pulses = (P->battery_pct >= 76) ? 4 :
+                                     (P->battery_pct >= 51) ? 3 :
+                                     (P->battery_pct >= 26) ? 2 : 1;
+                        ESP_LOGI(TAG, "[P%d] Battery check: %d%% (%d pulses)", slot + 1, P->battery_pct, pulses);
+                        haptic_start(P, pulses, 0x8000);
                     }
-                    s_asst_chord_used = true;
+                    P->asst_chord_used = true;
                 }
             }
 
-            /* 2-second hold combos (USB mode switch, Home Wi-Fi Auto-OTA, USB Bootloader) */
             uint32_t matched = 0;
             if ((cur & combo_base) == combo_base) {
                 uint32_t hold = cur & hold_mask;
@@ -1615,22 +1688,22 @@ static void stadia_transport_task(void *arg) {
             }
 
             if (matched != 0) {
-                s_asst_chord_used = true;
-                if (s_combo_active != matched) {
-                    s_combo_active = matched;
-                    s_combo_start_us = now;
-                } else if ((now - s_combo_start_us) >= 2000000) {
+                P->asst_chord_used = true;
+                if (P->combo_active != matched) {
+                    P->combo_active = matched;
+                    P->combo_start_us = now;
+                } else if ((now - P->combo_start_us) >= 2000000) {
                     if (matched == combo_ota) {
                         if (!ota_updater_schedule_sta_ota()) {
                             ESP_LOGW(TAG, "Auto-OTA combo ignored: configure Home Wi-Fi at http://192.168.4.1 first");
-                            haptic_start(1, 0x3500);
-                            s_combo_start_us = now + 5000000; /* debounce */
+                            haptic_start(P, 1, 0x3500);
+                            P->combo_start_us = now + 5000000;
                         } else {
                             ESP_LOGI(TAG, "Auto-OTA combo triggered -> rebooting into Home Wi-Fi updater");
                             for (int p = 0; p < 3; p++) {
-                                if (g_game.handshake_done) send_game_rumble(0x9000, 0x9000);
+                                if (P->game.handshake_done) send_game_rumble(P, 0x9000, 0x9000);
                                 vTaskDelay(pdMS_TO_TICKS(100));
-                                if (g_game.handshake_done) send_game_rumble(0, 0);
+                                if (P->game.handshake_done) send_game_rumble(P, 0, 0);
                                 vTaskDelay(pdMS_TO_TICKS(100));
                             }
                             ota_updater_reboot_clean(false);
@@ -1638,9 +1711,9 @@ static void stadia_transport_task(void *arg) {
                     } else if (matched == combo_boot) {
                         ESP_LOGI(TAG, "Bootloader combo triggered -> entering USB ROM Download Mode");
                         for (int p = 0; p < 4; p++) {
-                            if (g_game.handshake_done) send_game_rumble(0xA000, 0xA000);
+                            if (P->game.handshake_done) send_game_rumble(P, 0xA000, 0xA000);
                             vTaskDelay(pdMS_TO_TICKS(80));
-                            if (g_game.handshake_done) send_game_rumble(0, 0);
+                            if (P->game.handshake_done) send_game_rumble(P, 0, 0);
                             vTaskDelay(pdMS_TO_TICKS(80));
                         }
                         ota_updater_reboot_clean(true);
@@ -1651,28 +1724,30 @@ static void stadia_transport_task(void *arg) {
                         else if (matched == combo_ds4)    { target = USB_GAMEPAD_MODE_DS4;        pulses = 2; }
                         else if (matched == combo_switch) { target = USB_GAMEPAD_MODE_SWITCH_PRO; pulses = 3; }
                         else if (matched == combo_ps3)    { target = USB_GAMEPAD_MODE_PS3;        pulses = 4; }
-                        ESP_LOGI(TAG, "Mode combo triggered -> switching USB mode to %s",
-                                 usb_gamepad_mode_name(target));
+                        ESP_LOGI(TAG, "[P%d] Mode combo triggered -> switching USB mode to %s",
+                                 slot + 1, usb_gamepad_mode_name(target));
                         (void)usb_gamepad_save_mode(target);
                         for (int p = 0; p < pulses; p++) {
-                            if (g_game.handshake_done) send_game_rumble(0xB000, 0xB000);
+                            if (P->game.handshake_done) send_game_rumble(P, 0xB000, 0xB000);
                             vTaskDelay(pdMS_TO_TICKS(150));
-                            if (g_game.handshake_done) send_game_rumble(0, 0);
+                            if (P->game.handshake_done) send_game_rumble(P, 0, 0);
                             vTaskDelay(pdMS_TO_TICKS(150));
                         }
                         ota_updater_reboot_clean(false);
                     }
                 }
             } else {
-                s_combo_active = 0;
-                s_combo_start_us = 0;
+                P->combo_active = 0;
+                P->combo_start_us = 0;
             }
 
-            s_prev_btn = cur;
-            bool low_batt = (g_battery_pct >= 0 && g_battery_pct <= 15);
-            status_led_update(now, g_rpc_ready, usb_audio_is_mic_muted(), low_batt, s_combo_active != 0);
+            P->prev_btn = cur;
+            if (P->rpc_ready) any_ready = true;
+            if (P->battery_pct >= 0 && P->battery_pct <= 15) any_low_batt = true;
+            if (P->combo_active != 0) any_combo_held = true;
         }
 
+        status_led_update(now, any_ready, usb_audio_is_mic_muted(), any_low_batt, any_combo_held);
         service_audio_tx();
         usb_gamepad_keepalive_tick();
     }

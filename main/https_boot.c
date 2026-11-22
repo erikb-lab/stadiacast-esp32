@@ -1,4 +1,4 @@
-/* Phase 1: HTTPS boot server on port 443 + lightweight HTTP on port 80. */
+/* Phase 1: HTTPS boot server on port 443 + lightweight HTTP on port 80 (1..4 controllers). */
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -32,8 +32,22 @@ extern const char fullchain_pem_end[]   asm("_binary_fullchain_pem_end");
 extern const char privkey_pem_start[]   asm("_binary_privkey_pem_start");
 extern const char privkey_pem_end[]     asm("_binary_privkey_pem_end");
 
-stadia_session_t stadia_sess;   /* defined globally for main.c and handlers */
 static mbedtls_x509_crt sp_cert;
+
+static uint32_t get_req_peer_ip(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    if (fd < 0) return 0;
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) return 0;
+    if (ss.ss_family == AF_INET) {
+        return ((struct sockaddr_in *)&ss)->sin_addr.s_addr;
+    } else if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)&ss;
+        return s6->sin6_addr.un.u32_addr[3];
+    }
+    return 0;
+}
 
 /* Format the cert DER SHA-256 as "sha-256 AA:BB:CC:..." (like Stadiacast). */
 static void cert_fingerprint_hex(char *buf, size_t len) {
@@ -105,7 +119,6 @@ static esp_err_t post_clearcut(httpd_req_t *req) {
 
 static esp_err_t post_firmware_check(httpd_req_t *req) {
     ESP_LOGI(TAG, "POST /v1:FirmwareVersionCheck");
-    /* FirmwareVersionCheckResponse { requires_update = false } */
     gotham_discovery_FirmwareVersionCheckResponse *resp = calloc(1, sizeof(*resp));
     if (!resp) return send_response(req, "503", "", 0, "application/x-protobuf", NULL);
     resp->has_requires_update = true;
@@ -113,26 +126,24 @@ static esp_err_t post_firmware_check(httpd_req_t *req) {
 
     uint8_t buf[64];
     pb_ostream_t stream = pb_ostream_from_buffer(buf, sizeof(buf));
-    ESP_LOGI(TAG, "firmware_check: encoding");
     if (!pb_encode(&stream, gotham_discovery_FirmwareVersionCheckResponse_fields, resp)) {
         free(resp);
         return send_response(req, "500 Internal Server Error", "encode fail", 0, NULL, NULL);
     }
     free(resp);
-    ESP_LOGI(TAG, "firmware_check: encoded %zu", stream.bytes_written);
     return send_response(req, "200 OK", (char *)buf, stream.bytes_written, "application/x-protobuf", NULL);
 }
 
-static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle,
+static void build_sdp_answer(int slot,
+                             chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle,
                              const uint8_t *offer_bytes, size_t offer_len);
 
 static esp_err_t post_register_controller(httpd_req_t *req) {
-    /* Read entire body (loop until content_len bytes read) */
     static char body[4096];
     size_t body_len = req->content_len;
     if (body_len > sizeof(body) - 1) body_len = sizeof(body) - 1;
     ssize_t read = 0;
-    while (read < body_len) {
+    while (read < (ssize_t)body_len) {
         ssize_t r = httpd_req_recv(req, body + read, body_len - read);
         if (r <= 0) break;
         read += r;
@@ -143,55 +154,52 @@ static esp_err_t post_register_controller(httpd_req_t *req) {
     httpd_req_get_hdr_value_str(req, "controller-device-id", dev_id, sizeof(dev_id));
     httpd_req_get_hdr_value_str(req, "controller-cloud-device-id", cloud_id, sizeof(cloud_id));
 
-    ESP_LOGI(TAG, "POST /v1:RegisterController dev_id=%s cloud_id=%s body_len=%u read=%d",
-             dev_id, cloud_id, (unsigned)req->content_len, (int)read);
+    int slot = stadia_signaling_resolve_slot(dev_id, NULL, get_req_peer_ip(req));
+    stadia_session_t *sess = &stadia_sessions[slot];
 
-    /* Heap-allocate large protobuf structs */
+    ESP_LOGI(TAG, "[P%d] POST /v1:RegisterController dev_id=%s cloud_id=%s body_len=%u read=%d",
+             slot + 1, dev_id, cloud_id, (unsigned)req->content_len, (int)read);
+
     gotham_discovery_RegisterControllerRequest *req_msg = calloc(1, sizeof(*req_msg));
     if (!req_msg) return send_response(req, "503", "", 0, NULL, NULL);
     gotham_discovery_RegisterControllerResponse *resp = calloc(1, sizeof(*resp));
     if (!resp) { free(req_msg); return send_response(req, "503", "", 0, NULL, NULL); }
 
-    /* Decode RegisterControllerRequest */
     if (read > 0) {
         pb_istream_t istream = pb_istream_from_buffer((const uint8_t *)body, (size_t)read);
         if (!pb_decode(&istream, gotham_discovery_RegisterControllerRequest_fields, req_msg)) {
             char errmsg[128] = "(no errmsg)";
             if (istream.errmsg) snprintf(errmsg, sizeof(errmsg), "%s", istream.errmsg);
-            ESP_LOGW(TAG, "RegisterController: decode failed: %s", errmsg);
+            ESP_LOGW(TAG, "[P%d] RegisterController: decode failed: %s", slot + 1, errmsg);
         }
     }
-    ESP_LOGI(TAG, "RegisterController: dev_id=%s cloud_id=%s has_discovery=%d offer_size=%u",
-             dev_id, cloud_id, req_msg->has_discovery,
-             req_msg->has_discovery ? (unsigned)req_msg->discovery.sdp_offer_bundle.size : 0u);
 
-    /* Build RegisterControllerResponse */
     resp->has_registration_id = true;
     snprintf(resp->registration_id, sizeof(resp->registration_id), "local-%.40s", dev_id[0] ? dev_id : "controller");
     resp->poll_interval_ms = 250;
     resp->has_registration_token = true;
     snprintf(resp->registration_token, sizeof(resp->registration_token), "stadia-esp32");
-    stadia_sess.registered = true;
+    if (dev_id[0]) snprintf(sess->device_id, sizeof(sess->device_id), "%s", dev_id);
+    snprintf(sess->registration_id, sizeof(sess->registration_id), "%.63s", resp->registration_id);
+    sess->registered = true;
 
     if (req_msg->has_discovery) {
-        stadia_signaling_auto_link(&stadia_sess);
+        stadia_signaling_auto_link(sess);
         resp->which_result = gotham_discovery_RegisterControllerResponse_display_tag;
-        snprintf(resp->result.display.display_id, sizeof(resp->result.display.display_id), "%s", stadia_sess.display_id);
-        snprintf(resp->result.display.display_token, sizeof(resp->result.display.display_token), "%s", stadia_sess.display_token);
-        ESP_LOGI(TAG, "Auto-link: display_id=%s token=%s", stadia_sess.display_id, stadia_sess.display_token);
+        snprintf(resp->result.display.display_id, sizeof(resp->result.display.display_id), "%s", sess->display_id);
+        snprintf(resp->result.display.display_token, sizeof(resp->result.display.display_token), "%s", sess->display_token);
 
-        /* If autolink carries an offer, build SDP answer and queue on GMMsg immediately */
         if (req_msg->discovery.sdp_offer_bundle.size > 0) {
-            ESP_LOGI(TAG, "Autolink offer bundle: %u bytes -> queue SDP answer on GMMsg",
-                     (unsigned)req_msg->discovery.sdp_offer_bundle.size);
+            ESP_LOGI(TAG, "[P%d] Autolink offer bundle: %u bytes -> queue SDP answer on GMMsg",
+                     slot + 1, (unsigned)req_msg->discovery.sdp_offer_bundle.size);
             chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle = calloc(1, sizeof(*bundle));
             if (bundle) {
-                build_sdp_answer(bundle, req_msg->discovery.sdp_offer_bundle.bytes, req_msg->discovery.sdp_offer_bundle.size);
+                build_sdp_answer(slot, bundle, req_msg->discovery.sdp_offer_bundle.bytes, req_msg->discovery.sdp_offer_bundle.size);
                 static uint8_t bundle_buf[2048];
                 pb_ostream_t ostream = pb_ostream_from_buffer(bundle_buf, sizeof(bundle_buf));
                 if (pb_encode(&ostream, chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates_fields, bundle)) {
-                    ESP_LOGI(TAG, "Queued SDP answer bundle: %zu bytes", ostream.bytes_written);
-                    stadia_signaling_queue_gmsg(&stadia_sess, bundle_buf, ostream.bytes_written);
+                    ESP_LOGI(TAG, "[P%d] Queued SDP answer bundle: %zu bytes", slot + 1, ostream.bytes_written);
+                    stadia_signaling_queue_gmsg(sess, bundle_buf, ostream.bytes_written);
                 }
                 free(bundle);
             }
@@ -208,7 +216,8 @@ static esp_err_t post_register_controller(httpd_req_t *req) {
     return send_response(req, "200 OK", (char *)resp_buf, ostream.bytes_written, "application/x-protobuf", NULL);
 }
 
-static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle,
+static void build_sdp_answer(int slot,
+                             chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle,
                              const uint8_t *offer_bytes, size_t offer_len) {
     memset(bundle, 0, sizeof(*bundle));
     bundle->has_sdp = true;
@@ -218,7 +227,6 @@ static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCa
     sdp->has_sdp_answer = true;
     chrome_cloudcast_proto_api_common_RtcSdpAnswer *a = &sdp->sdp_answer;
 
-    /* Decode controller's offer bundle to extract ICE creds + IPv4 candidate & echo flags */
     bool raw_dtls = true;
     bool delayed_acks = false;
     bool use_rtp_ts = false;
@@ -241,12 +249,12 @@ static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCa
                         break;
                     }
                 }
-                ESP_LOGI(TAG, "Decoded offer: ufrag=%s raw_dtls=%d delayed_acks=%d rtp_ts=%d cand=%s:%u",
-                         o->ice_ufrag, (int)raw_dtls, (int)delayed_acks, (int)use_rtp_ts,
+                ESP_LOGI(TAG, "[P%d] Decoded offer: ufrag=%s raw_dtls=%d delayed_acks=%d rtp_ts=%d cand=%s:%u",
+                         slot + 1, o->ice_ufrag, (int)raw_dtls, (int)delayed_acks, (int)use_rtp_ts,
                          cand_ip ? cand_ip : "(none)", (unsigned)cand_port);
-                stadia_transport_set_remote(o->ice_ufrag, o->ice_password, cand_ip, cand_port);
+                stadia_transport_set_remote_slot(slot, o->ice_ufrag, o->ice_password, cand_ip, cand_port);
             } else {
-                ESP_LOGW(TAG, "Offer bundle decode failed: %s", is.errmsg ? is.errmsg : "(null)");
+                ESP_LOGW(TAG, "[P%d] Offer bundle decode failed: %s", slot + 1, is.errmsg ? is.errmsg : "(null)");
             }
             free(ob);
         }
@@ -258,7 +266,6 @@ static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCa
     snprintf(a->ice_password, sizeof(a->ice_password), "stadiaesp32pwd");
     a->has_fingerprint = true;
     {
-        /* 95-char "AA:BB:..." fingerprint + NUL (32 bytes, colons between) */
         char fp[96];
         cert_fingerprint_hex(fp, sizeof(fp));
         snprintf(a->fingerprint, sizeof(a->fingerprint), "sha-256 %s", fp);
@@ -276,7 +283,7 @@ static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCa
     a->has_disable_frame_tokens = true;
     a->disable_frame_tokens = true;
 
-    /* Add ICE host candidate: our WiFi IP + Phase 3 UDP port */
+    /* Add ICE host candidate: our WiFi IP + slot Display UDP port (50000 + slot*4) */
     {
         chrome_cloudcast_proto_api_common_WebRtcSdp *cand = &bundle->ice_candidate[bundle->ice_candidate_count];
         cand->has_type = true;
@@ -290,12 +297,11 @@ static void build_sdp_answer(chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCa
         c->has_foundation = true;
         snprintf(c->foundation, sizeof(c->foundation), "1");
         c->has_priority = true;
-        c->priority = (126u << 24) | (65535u << 8) | 255u; /* HOST_CANDIDATE_PRIORITY */
+        c->priority = (126u << 24) | (65535u << 8) | 255u;
         c->has_local_endpoint_ip = true;
-        /* SoftAP is the static 192.168.4.1 (configured in wifi_ap.c) */
         snprintf(c->local_endpoint_ip, sizeof(c->local_endpoint_ip), "192.168.4.1");
         c->has_local_endpoint_port = true;
-        c->local_endpoint_port = 50000;
+        c->local_endpoint_port = STADIA_SLOT_DISP_PORT(slot);
         bundle->ice_candidate_count++;
     }
 }
@@ -305,13 +311,16 @@ static esp_err_t post_discover_display(httpd_req_t *req) {
     size_t body_len = req->content_len;
     if (body_len > sizeof(body) - 1) body_len = sizeof(body) - 1;
     ssize_t read = 0;
-    while (read < body_len) {
+    while (read < (ssize_t)body_len) {
         ssize_t r = httpd_req_recv(req, body + read, body_len - read);
         if (r <= 0) break;
         read += r;
     }
     if (read > 0) body[read] = 0;
-    ESP_LOGI(TAG, "POST /v1:DiscoverDisplay body_len=%u read=%d", (unsigned)read, (int)read);
+
+    int slot = stadia_signaling_resolve_slot(NULL, NULL, get_req_peer_ip(req));
+    stadia_session_t *sess = &stadia_sessions[slot];
+    ESP_LOGI(TAG, "[P%d] POST /v1:DiscoverDisplay body_len=%u read=%d", slot + 1, (unsigned)read, (int)read);
 
     gotham_discovery_DiscoverDisplayRequest *req_msg = calloc(1, sizeof(*req_msg));
     if (!req_msg) return send_response(req, "503", "", 0, NULL, NULL);
@@ -320,21 +329,19 @@ static esp_err_t post_discover_display(httpd_req_t *req) {
         if (!pb_decode(&istream, gotham_discovery_DiscoverDisplayRequest_fields, req_msg)) {
             char errmsg[128] = "(no errmsg)";
             if (istream.errmsg) snprintf(errmsg, sizeof(errmsg), "%s", istream.errmsg);
-            ESP_LOGW(TAG, "DiscoverDisplay: decode failed: %s", errmsg);
+            ESP_LOGW(TAG, "[P%d] DiscoverDisplay: decode failed: %s", slot + 1, errmsg);
         }
     }
-    ESP_LOGI(TAG, "DiscoverDisplay: has_offer_bundle=%d bundle_size=%u",
-             req_msg->has_sdp_offer_bundle, (unsigned)req_msg->sdp_offer_bundle.size);
 
     if (req_msg->has_sdp_offer_bundle && req_msg->sdp_offer_bundle.size > 0) {
         chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates *bundle = calloc(1, sizeof(*bundle));
         if (bundle) {
-            build_sdp_answer(bundle, req_msg->sdp_offer_bundle.bytes, req_msg->sdp_offer_bundle.size);
+            build_sdp_answer(slot, bundle, req_msg->sdp_offer_bundle.bytes, req_msg->sdp_offer_bundle.size);
             static uint8_t bundle_buf[2048];
             pb_ostream_t ostream = pb_ostream_from_buffer(bundle_buf, sizeof(bundle_buf));
             if (pb_encode(&ostream, chrome_cloudcast_proto_api_common_WebRtcSdpAndIceCandidates_fields, bundle)) {
-                ESP_LOGI(TAG, "Queued SDP answer bundle: %zu bytes", ostream.bytes_written);
-                stadia_signaling_queue_gmsg(&stadia_sess, bundle_buf, ostream.bytes_written);
+                ESP_LOGI(TAG, "[P%d] Queued SDP answer bundle: %zu bytes", slot + 1, ostream.bytes_written);
+                stadia_signaling_queue_gmsg(sess, bundle_buf, ostream.bytes_written);
             }
             free(bundle);
         }
@@ -343,9 +350,9 @@ static esp_err_t post_discover_display(httpd_req_t *req) {
 
     gotham_discovery_DiscoverDisplayResponse *resp = calloc(1, sizeof(*resp));
     if (!resp) return send_response(req, "503", "", 0, NULL, NULL);
-    snprintf(resp->display_id, sizeof(resp->display_id), "%s", stadia_sess.display_id);
-    snprintf(resp->display_token, sizeof(resp->display_token), "%s", stadia_sess.display_token);
-    if (!stadia_sess.has_display) stadia_signaling_auto_link(&stadia_sess);
+    snprintf(resp->display_id, sizeof(resp->display_id), "%s", sess->display_id);
+    snprintf(resp->display_token, sizeof(resp->display_token), "%s", sess->display_token);
+    if (!sess->has_display) stadia_signaling_auto_link(sess);
 
     static uint8_t resp_buf[512];
     pb_ostream_t ostream = pb_ostream_from_buffer(resp_buf, sizeof(resp_buf));
@@ -409,9 +416,12 @@ static void gmsg_worker_task(void *arg) {
         return;
     }
 
+    int slot = stadia_signaling_resolve_slot(NULL, NULL, get_req_peer_ip(req));
+    stadia_session_t *sess = &stadia_sessions[slot];
+
     size_t msg_len = 0;
     uint32_t msg_id = 1;
-    bool has = stadia_signaling_gmsg_wait(&stadia_sess, 25000, msg_buf, GMMSG_MAX, &msg_len, &msg_id);
+    bool has = stadia_signaling_gmsg_wait(sess, 25000, msg_buf, GMMSG_MAX, &msg_len, &msg_id);
     if (!has) {
         send_response(req, "200 OK", "", 0, "application/x-protobuf", NULL);
     } else {
@@ -435,25 +445,31 @@ static esp_err_t gmsg_poll(httpd_req_t *req) {
         read += r;
     }
 
+    int slot = 0;
     gotham_discovery_GmsgPollRequest *poll_req = calloc(1, sizeof(*poll_req));
     if (poll_req && read > 0) {
         pb_istream_t istream = pb_istream_from_buffer((const uint8_t *)body, (size_t)read);
         if (!pb_decode(&istream, gotham_discovery_GmsgPollRequest_fields, poll_req)) {
             ESP_LOGW(TAG, "gmsg: decode failed: %s", istream.errmsg ? istream.errmsg : "(none)");
         }
-        ESP_LOGI(TAG, "POST /gmsg poll: subscription=%s has_ack=%d ack_id=%lld",
-                 poll_req->subscription, poll_req->has_last_message, (long long)poll_req->last_message.id);
-        stadia_signaling_mark_acked(&stadia_sess, poll_req->last_message.id);
+        slot = stadia_signaling_resolve_slot(NULL, poll_req->subscription, get_req_peer_ip(req));
+        ESP_LOGI(TAG, "[P%d] POST /gmsg poll: subscription=%s has_ack=%d ack_id=%lld",
+                 slot + 1, poll_req->subscription, poll_req->has_last_message, (long long)poll_req->last_message.id);
+        stadia_signaling_mark_acked(&stadia_sessions[slot], poll_req->last_message.id);
+    } else {
+        slot = stadia_signaling_resolve_slot(NULL, NULL, get_req_peer_ip(req));
     }
     free(poll_req);
     free(body);
+
+    stadia_session_t *sess = &stadia_sessions[slot];
 
     /* Fast synchronous path: reply immediately if SDP answer is already queued (zero task spawn) */
     uint8_t *msg_buf = malloc(GMMSG_MAX);
     if (msg_buf) {
         size_t msg_len = 0;
         uint32_t msg_id = 1;
-        if (stadia_signaling_gmsg_wait(&stadia_sess, 0, msg_buf, GMMSG_MAX, &msg_len, &msg_id)) {
+        if (stadia_signaling_gmsg_wait(sess, 0, msg_buf, GMMSG_MAX, &msg_len, &msg_id)) {
             gmsg_send_envelope(req, msg_buf, msg_len, msg_id);
             free(msg_buf);
             return ESP_OK;
@@ -520,29 +536,26 @@ static const httpd_uri_t uris[] = {
 static const size_t NUM_URIS = sizeof(uris) / sizeof(uris[0]);
 
 static void https_boot_task(void *arg) {
-    /* Parse cert for fingerprint */
     mbedtls_x509_crt_init(&sp_cert);
     int cert_rc = mbedtls_x509_crt_parse(&sp_cert, (const unsigned char *)fullchain_pem_start,
                            (size_t)(fullchain_pem_end - fullchain_pem_start));
     ESP_LOGI(TAG, "cert parse rc=%d, first_cert_ok=%d", cert_rc, sp_cert.next != NULL);
 
-    /* Start HTTP on :80 */
     https_boot_init_http80();
 
-    /* Start HTTPS on :443 */
     httpd_ssl_config_t httpd_ssl = HTTPD_SSL_CONFIG_DEFAULT();
     httpd_ssl.httpd.stack_size = 20480;
     httpd_ssl.httpd.task_priority = 6;
     httpd_ssl.httpd.max_uri_handlers = 16;
     httpd_ssl.httpd.max_open_sockets = 10;
     httpd_ssl.httpd.lru_purge_enable = true;
-    httpd_ssl.httpd.ctrl_port = 32769; /* Avoid collision with port 80 HTTP ctrl_port (32768) */
+    httpd_ssl.httpd.ctrl_port = 32769;
     httpd_ssl.port_secure = 443;
     httpd_ssl.servercert = (const uint8_t *)fullchain_pem_start;
     httpd_ssl.servercert_len = (size_t)(fullchain_pem_end - fullchain_pem_start);
     httpd_ssl.prvtkey_pem = (const uint8_t *)privkey_pem_start;
     httpd_ssl.prvtkey_len = (size_t)(privkey_pem_end - privkey_pem_start);
-    httpd_ssl.cert_select_cb = NULL; /* temporarily disabled to isolate crash */
+    httpd_ssl.cert_select_cb = NULL;
 
     httpd_handle_t server = NULL;
     if (httpd_ssl_start(&server, &httpd_ssl) != ESP_OK) {

@@ -1,4 +1,4 @@
-/* Phase 2: Discovery state, GMsg queue, auto-linking (ported from Stadiacast). */
+/* Phase 2: Discovery state, GMsg queue, auto-linking (1..4 controllers). */
 #ifndef STADIA_SIGNALING_H
 #define STADIA_SIGNALING_H
 
@@ -9,6 +9,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
+#define STADIA_MAX_PLAYERS 4
+
 /* Max sizes (validated against Stadiacast: real bodies are 470–600+ bytes) */
 #define DISPLAY_ID_MAX    63
 #define DISPLAY_TOKEN_MAX 63
@@ -16,15 +18,18 @@
 #define GMMSG_QUEUE_DEPTH 4
 #define REGISTER_ID_MAX   64
 
-/* Per-controller session (simplified: one controller supported for v1) */
 typedef struct {
+    int  slot;
     bool registered;
+    char device_id[REGISTER_ID_MAX];
     char registration_id[REGISTER_ID_MAX];
     int64_t poll_interval_ms;
     char registration_token[REGISTER_ID_MAX];
     bool has_display;                         /* display oneof set (autolink) */
     char display_id[DISPLAY_ID_MAX];
     char display_token[DISPLAY_TOKEN_MAX];
+    uint32_t peer_ip;
+    int64_t  last_seen_us;
     /* GMMsg queue */
     uint8_t  gmsg_queue[GMMSG_QUEUE_DEPTH][GMMSG_MAX];
     size_t   gmsg_queue_lens[GMMSG_QUEUE_DEPTH];
@@ -35,7 +40,12 @@ typedef struct {
     SemaphoreHandle_t gmsg_sem;               /* Wakes a parked /gmsg poll immediately */
 } stadia_session_t;
 
+extern stadia_session_t stadia_sessions[STADIA_MAX_PLAYERS];
+#define stadia_sess (stadia_sessions[0])
+
 void stadia_signaling_init(stadia_session_t *sess);
+void stadia_signaling_init_all(void);
+int  stadia_signaling_resolve_slot(const char *dev_id, const char *reg_or_sub, uint32_t peer_ip);
 void stadia_signaling_generate_ids(stadia_session_t *sess);           /* display_id/token */
 bool stadia_signaling_queue_gmsg(stadia_session_t *sess, const uint8_t *payload, size_t len);
 /* Pop the oldest pending GMMsg envelope payload (waits up to timeout_ms). */

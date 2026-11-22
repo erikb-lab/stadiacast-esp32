@@ -21,7 +21,6 @@
 
 extern void net_services_init(void);
 extern void https_boot_init(void);
-extern stadia_session_t stadia_sess;
 
 #define TAG "STADIACAST"
 #define STATUS_LED_GPIO GPIO_NUM_21
@@ -93,10 +92,11 @@ void app_main(void) {
     /* One-shot Home Wi-Fi / LAN Auto-OTA if requested via controller combo or Web UI */
     ota_updater_check_and_run();
 
-    stadia_signaling_init(&stadia_sess);
+    stadia_signaling_init_all();
     wifi_ap_init();
     net_services_init();
     https_boot_init();
+    usb_gamepad_set_rumble_slot_cb(stadia_transport_set_rumble_slot);
     usb_gamepad_init(stadia_transport_set_rumble);
 
     /* Confirm OTA image is healthy once Wi-Fi SoftAP, Web UI/OTA, and USB are up */

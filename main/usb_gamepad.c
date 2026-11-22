@@ -1,4 +1,5 @@
-/* Composite USB Gamepad (Stadia HID 18d1:9400 OR XInput 1209:9401) + Bidirectional UAC1 Audio. */
+/* Composite USB Gamepad (Stadia HID, XInput, DS4, Switch Pro, PS3) + Bidirectional UAC1 Audio
+ * + Experimental 1..4 Player Multi-Controller Co-Op mode. */
 #include "usb_gamepad.h"
 
 #include <math.h>
@@ -21,6 +22,7 @@
 
 #define NVS_NS_USB          "stadiacast"
 #define NVS_KEY_USB_MODE    "usb_mode"
+#define NVS_KEY_MAX_PLAYERS "max_players"
 #define NVS_KEY_STICK_DZ    "stick_dz"
 #define NVS_KEY_LAST_BATT   "last_batt"
 
@@ -105,8 +107,6 @@ static const uint8_t s_hid_config_desc[] = {
 _Static_assert(sizeof(s_hid_config_desc) == HID_DESC_TOTAL_LEN, "s_hid_config_desc size mismatch");
 
 /* ---------------- Mode 1: XInput (1209:9401) + MS OS 2.0 Descriptors ---------------- */
-/* VID 0x1209 is in Linux xpad for FF/5D/01, and avoids Windows xusb22.inf parent-grab
- * so usbccgp.sys splits ITF 0 -> xusb22.sys (via MS OS 2.0 XUSB10) & ITF 1..3 -> usbaudio.sys. */
 static const tusb_desc_device_t s_xinput_device_desc = {
     .bLength            = sizeof(tusb_desc_device_t),
     .bDescriptorType    = TUSB_DESC_DEVICE,
@@ -148,80 +148,56 @@ _Static_assert(sizeof(s_xinput_config_desc) == XIN_DESC_TOTAL_LEN, "s_xinput_con
 #define MS_OS_20_DESC_SET_LEN   46
 #define BOS_TOTAL_LEN           (5 + 28)
 
-static const uint8_t s_ms_os_20_bos_desc[] = {
-    /* BOS Descriptor Header (5 bytes) */
-    5, TUSB_DESC_BOS, U16_TO_U8S_LE(BOS_TOTAL_LEN), 1,
-    /* Microsoft OS 2.0 Platform Capability Descriptor (28 bytes) */
-    28, TUSB_DESC_DEVICE_CAPABILITY, 0x05 /* PLATFORM */, 0x00,
-    /* MS OS 2.0 UUID: {D8DD60DF-4589-4CC7-9CD2-659D9E648A9F} */
-    0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C,
-    0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F,
-    /* dwWindowsVersion: Windows 8.1+ (0x06030000) */
-    0x00, 0x00, 0x03, 0x06,
-    /* wMSOSDescriptorSetTotalLength */
-    U16_TO_U8S_LE(MS_OS_20_DESC_SET_LEN),
-    /* bMS_VendorCode, bAltEnumCode */
-    MS_OS_20_VENDOR_CODE, 0x00,
-};
-
-_Static_assert(sizeof(s_ms_os_20_bos_desc) == BOS_TOTAL_LEN, "BOS desc size mismatch");
-
-static const uint8_t s_ms_os_20_desc_set[] = {
-    /* Set Header (10 bytes): wLength=10, wDescriptorType=0x0000, dwWindowsVersion=0x06030000, wTotalLength=46 */
-    U16_TO_U8S_LE(10), U16_TO_U8S_LE(0x0000), 0x00, 0x00, 0x03, 0x06, U16_TO_U8S_LE(MS_OS_20_DESC_SET_LEN),
-    /* Configuration Subset Header (8 bytes): config index 0, wTotalLength=36 */
-    U16_TO_U8S_LE(8), U16_TO_U8S_LE(0x0001), 0x00, 0x00, U16_TO_U8S_LE(36),
-    /* Function Subset Header (8 bytes): bFirstInterface=0 (XInput), wSubsetLength=28 */
-    U16_TO_U8S_LE(8), U16_TO_U8S_LE(0x0002), USB_ITF_HID, 0x00, U16_TO_U8S_LE(28),
-    /* Compatible ID Descriptor (20 bytes): "XUSB10\0\0" -> binds Windows xusb22.sys to ITF 0 */
-    U16_TO_U8S_LE(20), U16_TO_U8S_LE(0x0003),
-    'X', 'U', 'S', 'B', '1', '0', 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-};
-
-_Static_assert(sizeof(s_ms_os_20_desc_set) == MS_OS_20_DESC_SET_LEN, "MS OS 2.0 set size mismatch");
+static uint8_t s_multi_config_desc[256];
+static uint8_t s_multi_bos_desc[BOS_TOTAL_LEN];
+static uint8_t s_multi_ms_os_20_desc_set[10 + 8 + USB_MAX_PLAYERS * 28];
+static uint16_t s_multi_ms_os_20_len = MS_OS_20_DESC_SET_LEN;
 
 /* ---------------- Shared State & Core-1 Marshaling ---------------- */
 static usb_gamepad_mode_t s_mode = USB_GAMEPAD_MODE_STADIA_HID;
+static uint8_t  s_max_players = 1;
 static uint16_t s_stick_deadzone = 0; /* 0..8192 (0=raw, 1310=4%, 2621=8%) */
 static portMUX_TYPE s_hid_mux = portMUX_INITIALIZER_UNLOCKED;
-static stadia_hid_report_t s_latest_hid = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
-static xinput_report_t s_latest_xin = { .report_id = 0x00, .report_size = 0x14 };
-static usb_canonical_input_t s_latest_canon = { .battery_pct = 100 };
-static bool s_dirty = false;
-static bool s_batt_dirty = false;
-static uint8_t s_battery_pct = 100; /* Last known 0..100% (persisted in NVS so UPower coldplug succeeds) */
-static int8_t  s_saved_batt_pct = -1;
-static bool    s_headset_plugged = false;
-static bool s_kick_pending = false;
-static int64_t s_last_tx_us = 0;
-static usb_rumble_cb_t s_rumble_cb = NULL;
-static bool s_usb_installed = false;
 
-/* ---------------- Custom TinyUSB XInput Class Driver ---------------- */
+static stadia_hid_report_t  s_latest_hid[USB_MAX_PLAYERS];
+static xinput_report_t      s_latest_xin[USB_MAX_PLAYERS];
+static usb_canonical_input_t s_latest_canon[USB_MAX_PLAYERS];
+static bool     s_dirty[USB_MAX_PLAYERS];
+static bool     s_batt_dirty[USB_MAX_PLAYERS];
+static uint8_t  s_battery_pct[USB_MAX_PLAYERS];
+static int64_t  s_last_tx_us[USB_MAX_PLAYERS];
+
+static int8_t   s_saved_batt_pct = -1;
+static bool     s_headset_plugged = false;
+static bool     s_kick_pending = false;
+static usb_rumble_cb_t      s_rumble_cb = NULL;
+static usb_rumble_slot_cb_t s_rumble_slot_cb = NULL;
+static bool     s_usb_installed = false;
+
+/* ---------------- Custom TinyUSB XInput Class Driver (1..4 Players) ---------------- */
 static uint8_t s_xin_rhport = 0;
-static uint8_t s_xin_ep_in  = 0;
-static uint8_t s_xin_ep_out = 0;
-static uint8_t s_xin_tx_buf[32];
-static uint8_t s_xin_rx_buf[32];
+static uint8_t s_xin_ep_in[USB_MAX_PLAYERS];
+static uint8_t s_xin_ep_out[USB_MAX_PLAYERS];
+static uint8_t s_xin_tx_buf[USB_MAX_PLAYERS][32];
+static uint8_t s_xin_rx_buf[USB_MAX_PLAYERS][32];
 
 static void hid_flush_on_tusb_task(void *arg);
 
 static void xinput_init(void) {
-    s_xin_ep_in = 0;
-    s_xin_ep_out = 0;
+    memset(s_xin_ep_in, 0, sizeof(s_xin_ep_in));
+    memset(s_xin_ep_out, 0, sizeof(s_xin_ep_out));
 }
 
 static bool xinput_deinit(void) {
-    s_xin_ep_in = 0;
-    s_xin_ep_out = 0;
+    memset(s_xin_ep_in, 0, sizeof(s_xin_ep_in));
+    memset(s_xin_ep_out, 0, sizeof(s_xin_ep_out));
     return true;
 }
 
 static void xinput_reset(uint8_t rhport) {
     (void)rhport;
-    s_xin_ep_in = 0;
-    s_xin_ep_out = 0;
+    memset(s_xin_ep_in, 0, sizeof(s_xin_ep_in));
+    memset(s_xin_ep_out, 0, sizeof(s_xin_ep_out));
 }
 
 static uint16_t xinput_open(uint8_t rhport, tusb_desc_interface_t const *itf_desc, uint16_t max_len) {
@@ -231,6 +207,7 @@ static uint16_t xinput_open(uint8_t rhport, tusb_desc_interface_t const *itf_des
         return 0;
     }
 
+    uint8_t slot = (itf_desc->bInterfaceNumber < USB_MAX_PLAYERS) ? itf_desc->bInterfaceNumber : 0;
     uint16_t drv_len = sizeof(tusb_desc_interface_t);
     uint8_t const *p_desc = tu_desc_next(itf_desc);
     uint8_t found = 0;
@@ -241,9 +218,9 @@ static uint16_t xinput_open(uint8_t rhport, tusb_desc_interface_t const *itf_des
             tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *)p_desc;
             if (!usbd_edpt_open(rhport, ep)) return 0;
             if (tu_edpt_dir(ep->bEndpointAddress) == TUSB_DIR_IN) {
-                s_xin_ep_in = ep->bEndpointAddress;
+                s_xin_ep_in[slot] = ep->bEndpointAddress;
             } else {
-                s_xin_ep_out = ep->bEndpointAddress;
+                s_xin_ep_out[slot] = ep->bEndpointAddress;
             }
             found++;
         }
@@ -252,8 +229,8 @@ static uint16_t xinput_open(uint8_t rhport, tusb_desc_interface_t const *itf_des
     }
 
     s_xin_rhport = rhport;
-    if (s_xin_ep_out) {
-        usbd_edpt_xfer(rhport, s_xin_ep_out, s_xin_rx_buf, sizeof(s_xin_rx_buf), false);
+    if (s_xin_ep_out[slot]) {
+        usbd_edpt_xfer(rhport, s_xin_ep_out[slot], s_xin_rx_buf[slot], sizeof(s_xin_rx_buf[slot]), false);
     }
     return drv_len;
 }
@@ -264,15 +241,23 @@ static bool xinput_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_r
 }
 
 static bool xinput_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
-    if (ep_addr == s_xin_ep_out) {
-        if (result == XFER_RESULT_SUCCESS && xferred_bytes >= 6 && s_xin_rx_buf[0] == 0x00 && s_rumble_cb) {
-            uint16_t strong = (uint16_t)s_xin_rx_buf[3] * 257u;
-            uint16_t weak   = (uint16_t)s_xin_rx_buf[4] * 257u;
-            s_rumble_cb(strong, weak);
+    for (int slot = 0; slot < (int)s_max_players; slot++) {
+        if (ep_addr == s_xin_ep_out[slot] && s_xin_ep_out[slot] != 0) {
+            if (result == XFER_RESULT_SUCCESS && xferred_bytes >= 6 && s_xin_rx_buf[slot][0] == 0x00) {
+                uint16_t strong = (uint16_t)s_xin_rx_buf[slot][3] * 257u;
+                uint16_t weak   = (uint16_t)s_xin_rx_buf[slot][4] * 257u;
+                if (s_rumble_slot_cb) {
+                    s_rumble_slot_cb(slot, strong, weak);
+                } else if (slot == 0 && s_rumble_cb) {
+                    s_rumble_cb(strong, weak);
+                }
+            }
+            usbd_edpt_xfer(rhport, s_xin_ep_out[slot], s_xin_rx_buf[slot], sizeof(s_xin_rx_buf[slot]), false);
+            return true;
+        } else if (ep_addr == s_xin_ep_in[slot] && s_xin_ep_in[slot] != 0) {
+            hid_flush_on_tusb_task(NULL);
+            return true;
         }
-        usbd_edpt_xfer(rhport, s_xin_ep_out, s_xin_rx_buf, sizeof(s_xin_rx_buf), false);
-    } else if (ep_addr == s_xin_ep_in) {
-        hid_flush_on_tusb_task(NULL);
     }
     return true;
 }
@@ -295,8 +280,90 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
 }
 
 /* ---------------- MS OS 2.0 Callbacks (XInput mode only) ---------------- */
+static void build_ms_os_20_descriptors(uint8_t players) {
+    uint16_t cfg_subset_len = (uint16_t)(8 + (uint16_t)players * 28u);
+    uint16_t total_set_len  = (uint16_t)(10 + cfg_subset_len);
+    s_multi_ms_os_20_len = total_set_len;
+
+    const uint8_t bos_tmpl[BOS_TOTAL_LEN] = {
+        5, TUSB_DESC_BOS, U16_TO_U8S_LE(BOS_TOTAL_LEN), 1,
+        28, TUSB_DESC_DEVICE_CAPABILITY, 0x05 /* PLATFORM */, 0x00,
+        0xDF, 0x60, 0xDD, 0xD8, 0x89, 0x45, 0xC7, 0x4C,
+        0x9C, 0xD2, 0x65, 0x9D, 0x9E, 0x64, 0x8A, 0x9F,
+        0x00, 0x00, 0x03, 0x06,
+        (uint8_t)(total_set_len & 0xFF), (uint8_t)(total_set_len >> 8),
+        MS_OS_20_VENDOR_CODE, 0x00,
+    };
+    memcpy(s_multi_bos_desc, bos_tmpl, sizeof(bos_tmpl));
+
+    uint8_t *p = s_multi_ms_os_20_desc_set;
+    /* Set Header (10 bytes) */
+    uint8_t hdr[18] = {
+        U16_TO_U8S_LE(10), U16_TO_U8S_LE(0x0000), 0x00, 0x00, 0x03, 0x06,
+        (uint8_t)(total_set_len & 0xFF), (uint8_t)(total_set_len >> 8),
+        /* Configuration Subset Header (8 bytes) */
+        U16_TO_U8S_LE(8), U16_TO_U8S_LE(0x0001), 0x00, 0x00,
+        (uint8_t)(cfg_subset_len & 0xFF), (uint8_t)(cfg_subset_len >> 8),
+    };
+    memcpy(p, hdr, sizeof(hdr));
+    p += sizeof(hdr);
+
+    for (uint8_t i = 0; i < players; i++) {
+        uint8_t fn[28] = {
+            /* Function Subset Header (8 bytes): bFirstInterface = i, wSubsetLength = 28 */
+            U16_TO_U8S_LE(8), U16_TO_U8S_LE(0x0002), i, 0x00, U16_TO_U8S_LE(28),
+            /* Compatible ID Descriptor (20 bytes): "XUSB10\0\0" */
+            U16_TO_U8S_LE(20), U16_TO_U8S_LE(0x0003),
+            'X', 'U', 'S', 'B', '1', '0', 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        };
+        memcpy(p, fn, sizeof(fn));
+        p += sizeof(fn);
+    }
+}
+
+static void build_multi_config_descriptor(usb_gamepad_mode_t mode, uint8_t players) {
+    uint8_t *p = s_multi_config_desc;
+    if (mode == USB_GAMEPAD_MODE_XINPUT) {
+        uint16_t total_len = (uint16_t)(TUD_CONFIG_DESC_LEN + (uint16_t)players * XINPUT_DESC_LEN);
+        uint8_t cfg_hdr[TUD_CONFIG_DESC_LEN] = {
+            TUD_CONFIG_DESCRIPTOR(1, players, 0, total_len, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250)
+        };
+        memcpy(p, cfg_hdr, sizeof(cfg_hdr));
+        p += sizeof(cfg_hdr);
+        for (uint8_t i = 0; i < players; i++) {
+            uint8_t ep_in  = (uint8_t)(0x81u + i);
+            uint8_t ep_out = (uint8_t)(0x01u + i);
+            uint8_t itf[XINPUT_DESC_LEN] = {
+                9, TUSB_DESC_INTERFACE, i, 0x00, 0x02, 0xFF, 0x5D, 0x01, 0x00,
+                0x11, 0x21, 0x00, 0x01, 0x01, 0x25, ep_in, 0x14, 0x00, 0x00, 0x00, 0x00, 0x13, ep_out, 0x08, 0x00, 0x00,
+                7, TUSB_DESC_ENDPOINT, ep_in,  TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(32), 1,
+                7, TUSB_DESC_ENDPOINT, ep_out, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(32), 8,
+            };
+            memcpy(p, itf, sizeof(itf));
+            p += sizeof(itf);
+        }
+    } else {
+        uint16_t total_len = (uint16_t)(TUD_CONFIG_DESC_LEN + (uint16_t)players * TUD_HID_INOUT_DESC_LEN);
+        uint8_t cfg_hdr[TUD_CONFIG_DESC_LEN] = {
+            TUD_CONFIG_DESCRIPTOR(1, players, 0, total_len, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250)
+        };
+        memcpy(p, cfg_hdr, sizeof(cfg_hdr));
+        p += sizeof(cfg_hdr);
+        for (uint8_t i = 0; i < players; i++) {
+            uint8_t ep_in  = (uint8_t)(0x81u + i);
+            uint8_t ep_out = (uint8_t)(0x01u + i);
+            uint8_t itf[TUD_HID_INOUT_DESC_LEN] = {
+                TUD_HID_INOUT_DESCRIPTOR(i, 0, HID_ITF_PROTOCOL_NONE, sizeof(s_hid_report_desc), ep_out, ep_in, 64, 1)
+            };
+            memcpy(p, itf, sizeof(itf));
+            p += sizeof(itf);
+        }
+    }
+}
+
 uint8_t const *tud_descriptor_bos_cb(void) {
-    return (s_mode == USB_GAMEPAD_MODE_XINPUT) ? s_ms_os_20_bos_desc : NULL;
+    return (s_mode == USB_GAMEPAD_MODE_XINPUT) ? s_multi_bos_desc : NULL;
 }
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *request) {
@@ -305,7 +372,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         request->bmRequestType_bit.type == TUSB_REQ_TYPE_VENDOR &&
         request->bRequest == MS_OS_20_VENDOR_CODE &&
         request->wIndex == 0x0007) {
-        return tud_control_xfer(rhport, request, (void *)(uintptr_t)s_ms_os_20_desc_set, sizeof(s_ms_os_20_desc_set));
+        return tud_control_xfer(rhport, request, (void *)(uintptr_t)s_multi_ms_os_20_desc_set, s_multi_ms_os_20_len);
     }
     return false;
 }
@@ -313,79 +380,94 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
 /* ---------------- Core-1 TX Marshaling (HID + XInput + Extra Modes) ---------------- */
 static void hid_flush_on_tusb_task(void *arg) {
     (void)arg;
-    stadia_hid_report_t hid_rep;
-    xinput_report_t xin_rep;
-    usb_canonical_input_t canon;
-    bool should_send = false;
-    bool send_batt = false;
-    uint8_t batt_pct = 100;
-
-    portENTER_CRITICAL(&s_hid_mux);
-    s_kick_pending = false;
-    canon = s_latest_canon;
-    canon.battery_pct = s_battery_pct;
-    canon.headset_plugged = s_headset_plugged;
-    if (s_dirty) {
-        hid_rep = s_latest_hid;
-        xin_rep = s_latest_xin;
-        s_dirty = false;
-        should_send = true;
-    } else if (s_batt_dirty && s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
-        batt_pct = s_battery_pct;
-        s_batt_dirty = false;
-        send_batt = true;
-    }
-    portEXIT_CRITICAL(&s_hid_mux);
 
     if (s_mode >= USB_GAMEPAD_MODE_DS4) {
+        usb_canonical_input_t canon;
+        bool should_send = false;
+        portENTER_CRITICAL(&s_hid_mux);
+        s_kick_pending = false;
+        canon = s_latest_canon[0];
+        canon.battery_pct = s_battery_pct[0];
+        canon.headset_plugged = s_headset_plugged;
+        if (s_dirty[0]) {
+            s_dirty[0] = false;
+            should_send = true;
+        }
+        portEXIT_CRITICAL(&s_hid_mux);
+
         bool sent_input = false;
         if (usb_modes_extra_flush_tx(s_mode, &canon, should_send, &sent_input)) {
             if (sent_input) {
-                s_last_tx_us = esp_timer_get_time();
+                s_last_tx_us[0] = esp_timer_get_time();
             } else if (should_send) {
-                /* Sent a priority handshake/subcmd reply; keep input dirty for completion cb */
                 portENTER_CRITICAL(&s_hid_mux);
-                s_dirty = true;
+                s_dirty[0] = true;
                 portEXIT_CRITICAL(&s_hid_mux);
             }
         } else if (should_send) {
             portENTER_CRITICAL(&s_hid_mux);
-            s_dirty = true;
+            s_dirty[0] = true;
             portEXIT_CRITICAL(&s_hid_mux);
         }
         return;
     }
 
-    if (should_send) {
-        if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
-            if (tud_mounted() && s_xin_ep_in && !usbd_edpt_busy(s_xin_rhport, s_xin_ep_in) &&
-                usbd_edpt_claim(s_xin_rhport, s_xin_ep_in)) {
-                memcpy(s_xin_tx_buf, &xin_rep, sizeof(xin_rep));
-                s_last_tx_us = esp_timer_get_time();
-                usbd_edpt_xfer(s_xin_rhport, s_xin_ep_in, s_xin_tx_buf, sizeof(xin_rep), false);
-            } else {
-                portENTER_CRITICAL(&s_hid_mux);
-                s_dirty = true;
-                portEXIT_CRITICAL(&s_hid_mux);
-            }
-        } else {
-            if (tud_mounted() && tud_hid_ready()) {
-                s_last_tx_us = esp_timer_get_time();
-                tud_hid_report(INPUT_REPORT_ID, &hid_rep, sizeof(hid_rep));
-            } else {
-                portENTER_CRITICAL(&s_hid_mux);
-                s_dirty = true;
-                portEXIT_CRITICAL(&s_hid_mux);
-            }
+    portENTER_CRITICAL(&s_hid_mux);
+    s_kick_pending = false;
+    portEXIT_CRITICAL(&s_hid_mux);
+
+    for (int slot = 0; slot < (int)s_max_players; slot++) {
+        stadia_hid_report_t hid_rep;
+        xinput_report_t xin_rep;
+        bool should_send = false;
+        bool send_batt = false;
+        uint8_t batt_pct = 100;
+
+        portENTER_CRITICAL(&s_hid_mux);
+        if (s_dirty[slot]) {
+            hid_rep = s_latest_hid[slot];
+            xin_rep = s_latest_xin[slot];
+            s_dirty[slot] = false;
+            should_send = true;
+        } else if (s_batt_dirty[slot] && s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
+            batt_pct = s_battery_pct[slot];
+            s_batt_dirty[slot] = false;
+            send_batt = true;
         }
-    } else if (send_batt) {
-        if (tud_mounted() && tud_hid_ready()) {
-            uint8_t lvl = (uint8_t)batt_pct;
-            tud_hid_report(BATTERY_REPORT_ID, &lvl, sizeof(lvl));
-        } else {
-            portENTER_CRITICAL(&s_hid_mux);
-            s_batt_dirty = true;
-            portEXIT_CRITICAL(&s_hid_mux);
+        portEXIT_CRITICAL(&s_hid_mux);
+
+        if (should_send) {
+            if (s_mode == USB_GAMEPAD_MODE_XINPUT) {
+                uint8_t ep_in = s_xin_ep_in[slot];
+                if (tud_mounted() && ep_in && !usbd_edpt_busy(s_xin_rhport, ep_in) &&
+                    usbd_edpt_claim(s_xin_rhport, ep_in)) {
+                    memcpy(s_xin_tx_buf[slot], &xin_rep, sizeof(xin_rep));
+                    s_last_tx_us[slot] = esp_timer_get_time();
+                    usbd_edpt_xfer(s_xin_rhport, ep_in, s_xin_tx_buf[slot], sizeof(xin_rep), false);
+                } else {
+                    portENTER_CRITICAL(&s_hid_mux);
+                    s_dirty[slot] = true;
+                    portEXIT_CRITICAL(&s_hid_mux);
+                }
+            } else {
+                if (tud_mounted() && tud_hid_n_ready((uint8_t)slot)) {
+                    s_last_tx_us[slot] = esp_timer_get_time();
+                    tud_hid_n_report((uint8_t)slot, INPUT_REPORT_ID, &hid_rep, sizeof(hid_rep));
+                } else {
+                    portENTER_CRITICAL(&s_hid_mux);
+                    s_dirty[slot] = true;
+                    portEXIT_CRITICAL(&s_hid_mux);
+                }
+            }
+        } else if (send_batt) {
+            if (tud_mounted() && tud_hid_n_ready((uint8_t)slot)) {
+                uint8_t lvl = batt_pct;
+                tud_hid_n_report((uint8_t)slot, BATTERY_REPORT_ID, &lvl, sizeof(lvl));
+            } else {
+                portENTER_CRITICAL(&s_hid_mux);
+                s_batt_dirty[slot] = true;
+                portEXIT_CRITICAL(&s_hid_mux);
+            }
         }
     }
 }
@@ -403,26 +485,26 @@ uint8_t const *tud_hid_descriptor_report_cb(uint8_t instance) {
 uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
                                hid_report_type_t report_type,
                                uint8_t *buffer, uint16_t reqlen) {
-    (void)instance;
+    int slot = (instance < USB_MAX_PLAYERS) ? (int)instance : 0;
     if (s_mode >= USB_GAMEPAD_MODE_DS4) {
         usb_canonical_input_t canon;
         portENTER_CRITICAL(&s_hid_mux);
-        canon = s_latest_canon;
-        canon.battery_pct = s_battery_pct;
+        canon = s_latest_canon[0];
+        canon.battery_pct = s_battery_pct[0];
         canon.headset_plugged = s_headset_plugged;
         portEXIT_CRITICAL(&s_hid_mux);
         return usb_modes_extra_get_report(s_mode, report_id, report_type, buffer, reqlen, &canon);
     }
     (void)report_type;
-    if (report_id == INPUT_REPORT_ID && reqlen >= sizeof(s_latest_hid)) {
+    if (report_id == INPUT_REPORT_ID && reqlen >= sizeof(s_latest_hid[0])) {
         portENTER_CRITICAL(&s_hid_mux);
-        memcpy(buffer, &s_latest_hid, sizeof(s_latest_hid));
+        memcpy(buffer, &s_latest_hid[slot], sizeof(s_latest_hid[0]));
         portEXIT_CRITICAL(&s_hid_mux);
-        return sizeof(s_latest_hid);
+        return sizeof(s_latest_hid[0]);
     }
     if (report_id == BATTERY_REPORT_ID && reqlen >= 1) {
         portENTER_CRITICAL(&s_hid_mux);
-        uint8_t pct = s_battery_pct;
+        uint8_t pct = s_battery_pct[slot];
         portEXIT_CRITICAL(&s_hid_mux);
         buffer[0] = pct;
         return 1;
@@ -433,12 +515,12 @@ uint16_t tud_hid_get_report_cb(uint8_t instance, uint8_t report_id,
 void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
                            hid_report_type_t report_type,
                            uint8_t const *buffer, uint16_t bufsize) {
-    (void)instance;
+    int slot = (instance < USB_MAX_PLAYERS) ? (int)instance : 0;
     if (s_mode >= USB_GAMEPAD_MODE_DS4) {
         usb_canonical_input_t canon;
         portENTER_CRITICAL(&s_hid_mux);
-        canon = s_latest_canon;
-        canon.battery_pct = s_battery_pct;
+        canon = s_latest_canon[0];
+        canon.battery_pct = s_battery_pct[0];
         canon.headset_plugged = s_headset_plugged;
         portEXIT_CRITICAL(&s_hid_mux);
         bool kick = false;
@@ -449,16 +531,24 @@ void tud_hid_set_report_cb(uint8_t instance, uint8_t report_id,
         return;
     }
     (void)report_type;
-    if (!s_rumble_cb || !buffer) return;
+    if (!buffer) return;
     uint16_t left = 0, right = 0;
+    bool got_rmb = false;
     if (report_id == RUMBLE_REPORT_ID && bufsize >= 4) {
         left  = (uint16_t)buffer[0] | ((uint16_t)buffer[1] << 8);
         right = (uint16_t)buffer[2] | ((uint16_t)buffer[3] << 8);
-        s_rumble_cb(left, right);
+        got_rmb = true;
     } else if (report_id == 0 && bufsize >= 5 && buffer[0] == RUMBLE_REPORT_ID) {
         left  = (uint16_t)buffer[1] | ((uint16_t)buffer[2] << 8);
         right = (uint16_t)buffer[3] | ((uint16_t)buffer[4] << 8);
-        s_rumble_cb(left, right);
+        got_rmb = true;
+    }
+    if (got_rmb) {
+        if (s_rumble_slot_cb) {
+            s_rumble_slot_cb(slot, left, right);
+        } else if (slot == 0 && s_rumble_cb) {
+            s_rumble_cb(left, right);
+        }
     }
 }
 
@@ -518,16 +608,18 @@ static uint8_t dpad_to_hat(uint32_t b) {
     return 8;
 }
 
-static void push_reports(const stadia_hid_report_t *hid, const xinput_report_t *xin,
-                         const usb_canonical_input_t *canon) {
-    if (!s_usb_installed) return;
+static void push_reports_slot(int slot,
+                              const stadia_hid_report_t *hid,
+                              const xinput_report_t *xin,
+                              const usb_canonical_input_t *canon) {
+    if (slot < 0 || slot >= USB_MAX_PLAYERS) return;
     bool kick = false;
     portENTER_CRITICAL(&s_hid_mux);
-    s_latest_hid = *hid;
-    s_latest_xin = *xin;
-    s_latest_canon = *canon;
-    s_dirty = true;
-    if (!s_kick_pending) {
+    s_latest_hid[slot]   = *hid;
+    s_latest_xin[slot]   = *xin;
+    s_latest_canon[slot] = *canon;
+    s_dirty[slot]        = true;
+    if (s_usb_installed && !s_kick_pending) {
         s_kick_pending = true;
         kick = true;
     }
@@ -537,10 +629,12 @@ static void push_reports(const stadia_hid_report_t *hid, const xinput_report_t *
     }
 }
 
-void usb_gamepad_send(uint32_t b,
-                      int32_t lx, int32_t ly,
-                      int32_t rx, int32_t ry,
-                      uint32_t lt, uint32_t rt) {
+void usb_gamepad_send_slot(int slot,
+                           uint32_t b,
+                           int32_t lx, int32_t ly,
+                           int32_t rx, int32_t ry,
+                           uint32_t lt, uint32_t rt) {
+    if (slot < 0 || slot >= USB_MAX_PLAYERS) return;
     uint16_t dz = s_stick_deadzone;
     if (dz > 0) {
         apply_radial_deadzone(&lx, &ly, dz);
@@ -614,16 +708,25 @@ void usb_gamepad_send(uint32_t b,
         .rt      = rt8,
     };
 
-    push_reports(&hid, &xin, &canon);
+    push_reports_slot(slot, &hid, &xin, &canon);
 }
 
-void usb_gamepad_get_latest_input(uint32_t *buttons,
-                                  int32_t *lx, int32_t *ly,
-                                  int32_t *rx, int32_t *ry,
-                                  uint8_t *lt, uint8_t *rt) {
+void usb_gamepad_send(uint32_t b,
+                      int32_t lx, int32_t ly,
+                      int32_t rx, int32_t ry,
+                      uint32_t lt, uint32_t rt) {
+    usb_gamepad_send_slot(0, b, lx, ly, rx, ry, lt, rt);
+}
+
+void usb_gamepad_get_latest_input_slot(int slot,
+                                       uint32_t *buttons,
+                                       int32_t *lx, int32_t *ly,
+                                       int32_t *rx, int32_t *ry,
+                                       uint8_t *lt, uint8_t *rt) {
+    if (slot < 0 || slot >= USB_MAX_PLAYERS) slot = 0;
     usb_canonical_input_t c;
     portENTER_CRITICAL(&s_hid_mux);
-    c = s_latest_canon;
+    c = s_latest_canon[slot];
     portEXIT_CRITICAL(&s_hid_mux);
     if (buttons) *buttons = c.buttons;
     if (lx)      *lx      = c.lx;
@@ -634,11 +737,25 @@ void usb_gamepad_get_latest_input(uint32_t *buttons,
     if (rt)      *rt      = c.rt;
 }
 
-void usb_gamepad_reset(void) {
+void usb_gamepad_get_latest_input(uint32_t *buttons,
+                                  int32_t *lx, int32_t *ly,
+                                  int32_t *rx, int32_t *ry,
+                                  uint8_t *lt, uint8_t *rt) {
+    usb_gamepad_get_latest_input_slot(0, buttons, lx, ly, rx, ry, lt, rt);
+}
+
+void usb_gamepad_reset_slot(int slot) {
+    if (slot < 0 || slot >= USB_MAX_PLAYERS) return;
     stadia_hid_report_t hid_neutral = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
     xinput_report_t xin_neutral = { .report_id = 0x00, .report_size = 0x14 };
     usb_canonical_input_t canon_neutral = { 0 };
-    push_reports(&hid_neutral, &xin_neutral, &canon_neutral);
+    push_reports_slot(slot, &hid_neutral, &xin_neutral, &canon_neutral);
+}
+
+void usb_gamepad_reset(void) {
+    for (int slot = 0; slot < (int)s_max_players; slot++) {
+        usb_gamepad_reset_slot(slot);
+    }
 }
 
 void usb_gamepad_keepalive_tick(void) {
@@ -647,22 +764,26 @@ void usb_gamepad_keepalive_tick(void) {
     int64_t interval_us = (s_mode >= USB_GAMEPAD_MODE_DS4)
                           ? usb_modes_extra_keepalive_us(s_mode)
                           : 100000;
-    if ((now - s_last_tx_us) >= interval_us) {
-        bool kick = false;
-        portENTER_CRITICAL(&s_hid_mux);
-        s_dirty = true;
-        if (!s_kick_pending) {
-            s_kick_pending = true;
-            kick = true;
+    bool need_kick = false;
+    portENTER_CRITICAL(&s_hid_mux);
+    for (int slot = 0; slot < (int)s_max_players; slot++) {
+        if ((now - s_last_tx_us[slot]) >= interval_us) {
+            s_dirty[slot] = true;
+            need_kick = true;
         }
-        portEXIT_CRITICAL(&s_hid_mux);
-        if (kick) {
-            usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
-        }
+    }
+    if (need_kick && !s_kick_pending) {
+        s_kick_pending = true;
+    } else {
+        need_kick = false;
+    }
+    portEXIT_CRITICAL(&s_hid_mux);
+    if (need_kick) {
+        usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
     }
 }
 
-/* ---------------- NVS Mode Persistence & Init ---------------- */
+/* ---------------- NVS Mode & Multi-Player Persistence & Init ---------------- */
 static usb_gamepad_mode_t load_mode_from_nvs(void) {
     nvs_handle_t h;
     uint8_t val = (uint8_t)USB_GAMEPAD_MODE_STADIA_HID;
@@ -673,6 +794,35 @@ static usb_gamepad_mode_t load_mode_from_nvs(void) {
     return (val < (uint8_t)USB_GAMEPAD_MODE_COUNT)
            ? (usb_gamepad_mode_t)val
            : USB_GAMEPAD_MODE_STADIA_HID;
+}
+
+static uint8_t load_max_players_from_nvs(void) {
+    nvs_handle_t h;
+    uint8_t val = 1;
+    if (nvs_open(NVS_NS_USB, NVS_READONLY, &h) == ESP_OK) {
+        (void)nvs_get_u8(h, NVS_KEY_MAX_PLAYERS, &val);
+        nvs_close(h);
+    }
+    if (val < 1 || val > USB_MAX_PLAYERS) val = 1;
+    return val;
+}
+
+uint8_t usb_gamepad_get_max_players(void) {
+    return s_max_players;
+}
+
+bool usb_gamepad_save_max_players(uint8_t count) {
+    if (count < 1 || count > USB_MAX_PLAYERS) return false;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_USB, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u8(h, NVS_KEY_MAX_PLAYERS, count);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err == ESP_OK;
+}
+
+void usb_gamepad_set_rumble_slot_cb(usb_rumble_slot_cb_t cb) {
+    s_rumble_slot_cb = cb;
 }
 
 usb_gamepad_mode_t usb_gamepad_get_mode(void) {
@@ -691,6 +841,7 @@ const char *usb_gamepad_mode_name(usb_gamepad_mode_t mode) {
 }
 
 bool usb_gamepad_mode_has_audio(usb_gamepad_mode_t mode) {
+    if (s_max_players > 1) return false;
     return (mode == USB_GAMEPAD_MODE_STADIA_HID ||
             mode == USB_GAMEPAD_MODE_XINPUT ||
             mode == USB_GAMEPAD_MODE_DS4);
@@ -722,21 +873,21 @@ uint16_t usb_gamepad_get_deadzone(void) {
     return s_stick_deadzone;
 }
 
-void usb_gamepad_set_battery(int pct) {
-    if (pct < 0) return; /* Keep last valid percentage for OS GET_REPORT queries */
+void usb_gamepad_set_battery_slot(int slot, int pct) {
+    if (slot < 0 || slot >= USB_MAX_PLAYERS || pct < 0) return;
     uint8_t val = (uint8_t)(pct > 100 ? 100 : pct);
     bool kick = false;
     portENTER_CRITICAL(&s_hid_mux);
-    s_battery_pct = val;
+    s_battery_pct[slot] = val;
     if (s_usb_installed) {
         if (s_mode == USB_GAMEPAD_MODE_STADIA_HID) {
-            s_batt_dirty = true;
+            s_batt_dirty[slot] = true;
             if (!s_kick_pending) {
                 s_kick_pending = true;
                 kick = true;
             }
-        } else if (s_mode >= USB_GAMEPAD_MODE_DS4) {
-            s_dirty = true;
+        } else if (slot == 0 && s_mode >= USB_GAMEPAD_MODE_DS4) {
+            s_dirty[0] = true;
             if (!s_kick_pending) {
                 s_kick_pending = true;
                 kick = true;
@@ -747,7 +898,7 @@ void usb_gamepad_set_battery(int pct) {
     if (kick) {
         usbd_defer_func(hid_flush_on_tusb_task, NULL, false);
     }
-    if ((int8_t)val != s_saved_batt_pct) {
+    if (slot == 0 && (int8_t)val != s_saved_batt_pct) {
         s_saved_batt_pct = (int8_t)val;
         nvs_handle_t h;
         if (nvs_open(NVS_NS_USB, NVS_READWRITE, &h) == ESP_OK) {
@@ -759,13 +910,17 @@ void usb_gamepad_set_battery(int pct) {
     }
 }
 
+void usb_gamepad_set_battery(int pct) {
+    usb_gamepad_set_battery_slot(0, pct);
+}
+
 void usb_gamepad_set_headset(bool plugged) {
     bool kick = false;
     portENTER_CRITICAL(&s_hid_mux);
     if (s_headset_plugged != plugged) {
         s_headset_plugged = plugged;
         if (s_usb_installed && s_mode == USB_GAMEPAD_MODE_DS4) {
-            s_dirty = true;
+            s_dirty[0] = true;
             if (!s_kick_pending) {
                 s_kick_pending = true;
                 kick = true;
@@ -796,6 +951,15 @@ void usb_gamepad_uninstall(void) {
 void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
     s_rumble_cb = rumble_cb;
     s_mode = load_mode_from_nvs();
+    s_max_players = load_max_players_from_nvs();
+
+    for (int i = 0; i < USB_MAX_PLAYERS; i++) {
+        s_latest_hid[i] = (stadia_hid_report_t){ .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
+        s_latest_xin[i] = (xinput_report_t){ .report_id = 0x00, .report_size = 0x14 };
+        s_latest_canon[i] = (usb_canonical_input_t){ .battery_pct = 100 };
+        s_battery_pct[i] = 100;
+    }
+
     {
         nvs_handle_t h;
         uint16_t saved_dz = 0;
@@ -803,12 +967,23 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
         if (nvs_open(NVS_NS_USB, NVS_READONLY, &h) == ESP_OK) {
             (void)nvs_get_u16(h, NVS_KEY_STICK_DZ, &saved_dz);
             if (nvs_get_u8(h, NVS_KEY_LAST_BATT, &saved_batt) == ESP_OK && saved_batt <= 100u) {
-                s_battery_pct = saved_batt;
+                s_battery_pct[0] = saved_batt;
                 s_saved_batt_pct = (int8_t)saved_batt;
             }
             nvs_close(h);
         }
         if (saved_dz <= 8192u) s_stick_deadzone = saved_dz;
+    }
+
+    if (s_max_players > 1 && s_mode >= USB_GAMEPAD_MODE_DS4) {
+        ESP_LOGW(TAG, "Experimental Multi-Controller (%u players) uses XInput or Stadia HID; defaulting to XInput",
+                 (unsigned)s_max_players);
+        s_mode = USB_GAMEPAD_MODE_XINPUT;
+    }
+
+    build_ms_os_20_descriptors(s_max_players);
+    if (s_max_players > 1) {
+        build_multi_config_descriptor(s_mode, s_max_players);
     }
 
     usb_modes_extra_init(s_mode, rumble_cb);
@@ -821,9 +996,9 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
             .string_descriptor        = s_xinput_string_desc,
             .string_descriptor_count  = sizeof(s_xinput_string_desc) / sizeof(s_xinput_string_desc[0]),
             .external_phy             = false,
-            .configuration_descriptor = s_xinput_config_desc,
+            .configuration_descriptor = (s_max_players > 1) ? s_multi_config_desc : s_xinput_config_desc,
         };
-    } else if (s_mode >= USB_GAMEPAD_MODE_DS4 && usb_modes_extra_get_tusb_cfg(s_mode, &tusb_cfg)) {
+    } else if (s_max_players == 1 && s_mode >= USB_GAMEPAD_MODE_DS4 && usb_modes_extra_get_tusb_cfg(s_mode, &tusb_cfg)) {
         /* Configured by usb_modes_extra */
     } else {
         s_mode = USB_GAMEPAD_MODE_STADIA_HID;
@@ -832,7 +1007,7 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
             .string_descriptor        = s_hid_string_desc,
             .string_descriptor_count  = sizeof(s_hid_string_desc) / sizeof(s_hid_string_desc[0]),
             .external_phy             = false,
-            .configuration_descriptor = s_hid_config_desc,
+            .configuration_descriptor = (s_max_players > 1) ? s_multi_config_desc : s_hid_config_desc,
         };
     }
 
@@ -842,7 +1017,8 @@ void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
         return;
     }
     s_usb_installed = true;
-    ESP_LOGI(TAG, "USB mode=%s (%s) ready",
+    ESP_LOGI(TAG, "USB mode=%s players=%u (%s) ready",
              usb_gamepad_mode_name(s_mode),
+             (unsigned)s_max_players,
              usb_gamepad_mode_has_audio(s_mode) ? "+ UAC1 audio" : "HID-only");
 }

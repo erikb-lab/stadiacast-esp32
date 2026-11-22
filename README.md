@@ -16,6 +16,11 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
   - **Headset Output (Speaker):** 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
   - **Headset Input (Mic):** controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
   - **Hardware Mic Mute** & **Configurable Mic Gain** (`1.0x / 1.5x / 2.0x / 2.5x`, saved in NVS)
+- **🧪 Experimental 1–4 Player Multi-Controller Co-Op Mode (`v1.8.5`):**
+  - Connect **up to 4 Wi-Fi Stadia Controllers to a single ESP32-S3 dongle**!
+  - Configurable at `http://192.168.4.1` (**Gamepad & Audio → Players: `1..4`**).
+  - **`1 Player` (Default):** 1 Gamepad + full-duplex 48 kHz UAC1 USB Audio across all 5 USB controller modes.
+  - **`2–4 Players` (Experimental Co-Op):** Dedicates all 4 ESP32-S3 hardware USB-OTG IN endpoints (`EP1..EP4`) and 4 dual-port DTLS 1.2 + SCTP transport pairs (`UDP 50000..50014`) to expose **2, 3, or 4 independent XInput (Xbox 360) or Stadia HID gamepads** with independent per-player rumble and battery reporting over a single USB port (disables UAC1 USB audio while `>1` player is active).
 - **On-Board BLE Auto-Provisioning (Zero Phone/PC App Needed):**
   - Put any Wi-Fi Stadia Controller into orange-blink setup mode near the dongle and the ESP32-S3 automatically pairs it over Bluetooth LE (`0xFE2C` Fast Pair → `0xFEA0` RSA-2048 encrypted credentials). BLE scanning pauses completely while a controller is connected over Wi-Fi so there is zero gaming/audio jitter.
 - **Web Dashboard + Over-the-Air (OTA) Firmware Updates (`http://192.168.4.1`):**
@@ -95,7 +100,7 @@ Open the **[Stadia Wireless Adapter Web Flasher](https://erikb-lab.github.io/sta
 
 ### Manual Download (`esptool` CLI)
 
-Download `stadiacast-esp32-v1.7.0-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
+Download `stadiacast-esp32-v1.8.5-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -112,7 +117,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.7.0-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.8.5-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -132,7 +137,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.7.0-merged.bin
+  0x0 stadiacast-esp32-v1.8.5-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -151,7 +156,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.7.0-merged.bin
+  0x0 stadiacast-esp32-v1.8.5-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -168,7 +173,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.7.0-merged.bin
+  0x0 stadiacast-esp32-v1.8.5-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:
