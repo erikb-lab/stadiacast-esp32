@@ -18,9 +18,6 @@ Stadia Controller over USB-C as a native composite **Google Stadia Controller
 - **Google Stadia Controller** running original **Wi-Fi firmware** (not converted to Bluetooth)
   - SoftAP SSID: `STADIA_ESP32`
   - SoftAP Password: `stadiacast`
-- Optional jumper on **D0 (GPIO1) → GND**:
-  - **Grounded at power-on**: Serial / Flash mode (USB HID + Audio disabled so the USB Serial/JTAG port stays open)
-  - **Open (default)**: Normal USB HID + UAC1 Audio mode
 
 ---
 
@@ -29,15 +26,13 @@ Stadia Controller over USB-C as a native composite **Google Stadia Controller
 Download `stadiacast-esp32-v1.0.0-merged.bin` from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
-### Step 1: Put the XIAO ESP32-S3 into Flash / Bootloader Mode
+### Step 1: Enter Bootloader Mode
 
-Because the firmware switches the USB-C port into HID + Audio mode on normal boot, put the board into ROM bootloader mode before flashing:
+Because the firmware switches USB-C into HID + Audio mode on normal boot, put the XIAO ESP32-S3 into ROM bootloader mode before flashing:
 
 1. Hold the **`B` (BOOT)** button on the XIAO ESP32-S3.
 2. While holding `B`, plug the USB-C cable into your computer (or tap **`R` (RESET)** if already plugged in).
 3. Release **`B`**.
-
-*(Alternatively, if you have a jumper shorting **D0 (GPIO1)** to **GND**, just plug the board in normally.)*
 
 ### Option A: Flash in Your Browser (Windows, macOS, Linux)
 
@@ -46,7 +41,7 @@ No software install required (requires Chrome, Edge, or Brave):
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
 3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.0.0-merged.bin`, and click **Program**.
-4. When complete, unplug and replug the XIAO ESP32-S3 (making sure D0 is not grounded).
+4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
 
@@ -118,7 +113,7 @@ You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** plus both a 
 
 ## Using the Dongle
 
-1. Plug the flashed XIAO ESP32-S3 into your PC/Mac/Linux host (D0 open).
+1. Plug the flashed XIAO ESP32-S3 into your Windows, macOS, or Linux host.
 2. Provision your Wi-Fi Stadia Controller to the SoftAP **`STADIA_ESP32`** (password: **`stadiacast`**) if it is not already linked.
 3. Turn on the Stadia Controller. Within ~4–6 seconds it will connect and turn solid white.
 4. Plug a 3.5 mm headset into the controller and select **`Stadia Controller rev. A`** as your OS audio output and/or input device.
@@ -134,6 +129,8 @@ source /path/to/esp-idf-5.5.4/export.sh
 idf.py build
 ./tools/flash.sh
 ```
+
+Put the board in bootloader mode before running `./tools/flash.sh`: hold **`B`**, tap **`R`**, release **`B`**.
 
 ### Certificates
 
