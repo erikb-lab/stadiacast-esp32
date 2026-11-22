@@ -9,9 +9,12 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
+#include "nvs.h"
 #include "opus.h"
 
 #define TAG "STADIA-OPUS"
+#define NVS_NS_AUDIO       "stadiacast"
+#define NVS_KEY_MIC_GAIN   "mic_gain"
 
 extern void stadia_transport_wake(void);
 
@@ -47,8 +50,9 @@ static int16_t       s_mic_pcm[MIC_RING_CAP];
 static atomic_uint   s_mic_head = ATOMIC_VAR_INIT(0);
 static atomic_uint   s_mic_tail = ATOMIC_VAR_INIT(0);
 
-static atomic_bool   s_loopback = ATOMIC_VAR_INIT(false);
-static TaskHandle_t  s_opus_task = NULL;
+static atomic_bool          s_loopback = ATOMIC_VAR_INIT(false);
+static atomic_uint_fast16_t s_mic_gain_q8 = ATOMIC_VAR_INIT(256u); /* 256 = 1.0x */
+static TaskHandle_t         s_opus_task = NULL;
 
 /* Scratch frame buffers for Core 1 worker */
 static int16_t s_dec_mono[STADIA_FRAME_SAMPLES];
@@ -61,6 +65,23 @@ void stadia_opus_set_loopback(bool enable) {
 
 bool stadia_opus_is_loopback(void) {
     return atomic_load(&s_loopback);
+}
+
+void stadia_opus_set_mic_gain_q8(uint16_t gain_q8) {
+    if (gain_q8 < 128u) gain_q8 = 128u;
+    if (gain_q8 > 768u) gain_q8 = 768u;
+    atomic_store_explicit(&s_mic_gain_q8, gain_q8, memory_order_release);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_AUDIO, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_u16(h, NVS_KEY_MIC_GAIN, gain_q8) == ESP_OK) {
+            (void)nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+}
+
+uint16_t stadia_opus_get_mic_gain_q8(void) {
+    return (uint16_t)atomic_load_explicit(&s_mic_gain_q8, memory_order_acquire);
 }
 
 void stadia_opus_notify(void) {
@@ -270,6 +291,15 @@ static void opus_worker_task(void *arg) {
                             push_tx_packet(s_enc_pkt, (size_t)elen);
                         }
                     } else {
+                        uint16_t g = (uint16_t)atomic_load_explicit(&s_mic_gain_q8, memory_order_relaxed);
+                        if (g != 256u) {
+                            for (int i = 0; i < ns; i++) {
+                                int32_t v = ((int32_t)s_dec_mono[i] * (int32_t)g) >> 8;
+                                if (v > 32767) v = 32767;
+                                else if (v < -32768) v = -32768;
+                                s_dec_mono[i] = (int16_t)v;
+                            }
+                        }
                         write_mic_frame(s_dec_mono, (size_t)ns);
                     }
                 }
@@ -312,5 +342,14 @@ static void opus_worker_task(void *arg) {
 }
 
 void stadia_opus_init(void) {
+    nvs_handle_t h;
+    uint16_t saved_gain = 256u;
+    if (nvs_open(NVS_NS_AUDIO, NVS_READONLY, &h) == ESP_OK) {
+        (void)nvs_get_u16(h, NVS_KEY_MIC_GAIN, &saved_gain);
+        nvs_close(h);
+    }
+    if (saved_gain >= 128u && saved_gain <= 768u) {
+        atomic_store_explicit(&s_mic_gain_q8, saved_gain, memory_order_release);
+    }
     xTaskCreatePinnedToCore(opus_worker_task, "opus_audio", 16384, NULL, 3, &s_opus_task, 1);
 }

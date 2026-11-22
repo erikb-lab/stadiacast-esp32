@@ -16,6 +16,10 @@ void stadia_opus_init(void);
 void stadia_opus_set_loopback(bool enable);
 bool stadia_opus_is_loopback(void);
 
+/* Mic gain in Q8 fixed-point (256=1.0x, 384=1.5x, 512=2.0x, 640=2.5x), persisted in NVS */
+void     stadia_opus_set_mic_gain_q8(uint16_t gain_q8);
+uint16_t stadia_opus_get_mic_gain_q8(void);
+
 /* Wake Core 1 Opus worker immediately (task or ISR context) */
 void stadia_opus_notify(void);
 void stadia_opus_notify_from_isr(void);

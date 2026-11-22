@@ -37,4 +37,6 @@ void usb_audio_init(void);
 void usb_audio_get_stats(usb_audio_stats_t *out_stats);
 bool usb_audio_spk_active(void);
 bool usb_audio_mic_active(void);
+void usb_audio_set_mic_muted(bool muted);
+bool usb_audio_is_mic_muted(void);
 size_t usb_audio_read_spk_pcm(int16_t *stereo_out, size_t max_frames);

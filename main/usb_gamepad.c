@@ -1,6 +1,7 @@
 /* Composite USB Gamepad (Stadia HID 18d1:9400 OR XInput 1209:9401) + Bidirectional UAC1 Audio. */
 #include "usb_gamepad.h"
 
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
@@ -19,6 +20,7 @@
 
 #define NVS_NS_USB          "stadiacast"
 #define NVS_KEY_USB_MODE    "usb_mode"
+#define NVS_KEY_STICK_DZ    "stick_dz"
 
 #define INPUT_REPORT_ID     3
 #define RUMBLE_REPORT_ID    5
@@ -130,7 +132,7 @@ static const tusb_desc_device_t s_hid_device_desc = {
 static const char *s_hid_string_desc[] = {
     (const char[]){ 0x09, 0x04 },
     "Google Inc.",
-    "Stadia Controller rev. A",
+    "Stadia Wireless Adapter",
     "STADIA-WIFI-S3",
 };
 
@@ -166,7 +168,7 @@ static const tusb_desc_device_t s_xinput_device_desc = {
 static const char *s_xinput_string_desc[] = {
     (const char[]){ 0x09, 0x04 },
     "Stadiacast",
-    "Stadia Controller (XInput)",
+    "Stadia Wireless Adapter XInput",
     "STADIA-XIN-S3",
 };
 
@@ -222,6 +224,7 @@ _Static_assert(sizeof(s_ms_os_20_desc_set) == MS_OS_20_DESC_SET_LEN, "MS OS 2.0 
 
 /* ---------------- Shared State & Core-1 Marshaling ---------------- */
 static usb_gamepad_mode_t s_mode = USB_GAMEPAD_MODE_STADIA_HID;
+static uint16_t s_stick_deadzone = 0; /* 0..8192 (0=raw, 1310=4%, 2621=8%) */
 static portMUX_TYPE s_hid_mux = portMUX_INITIALIZER_UNLOCKED;
 static stadia_hid_report_t s_latest_hid = { .hat = 8, .lx = 128, .ly = 128, .rx = 128, .ry = 128 };
 static xinput_report_t s_latest_xin = { .report_id = 0x00, .report_size = 0x14 };
@@ -442,6 +445,25 @@ static int16_t clamp_i16(int32_t v) {
     return (int16_t)v;
 }
 
+/* Smooth rescaled radial deadzone (zero jump past edge; bypass when dz == 0) */
+static void apply_radial_deadzone(int32_t *x, int32_t *y, uint16_t dz) {
+    if (dz == 0) return;
+    float fx = (float)(*x);
+    float fy = (float)(*y);
+    float mag = sqrtf(fx * fx + fy * fy);
+    if (mag <= (float)dz) {
+        *x = 0;
+        *y = 0;
+        return;
+    }
+    float max_r = 32767.0f;
+    float norm = (mag - (float)dz) / (max_r - (float)dz);
+    if (norm > 1.0f) norm = 1.0f;
+    float scale = (norm * max_r) / mag;
+    *x = (int32_t)lroundf(fx * scale);
+    *y = (int32_t)lroundf(fy * scale);
+}
+
 static uint8_t dpad_to_hat(uint32_t b) {
     bool u = (b & (1u << 0)) != 0;
     bool d = (b & (1u << 1)) != 0;
@@ -479,6 +501,12 @@ void usb_gamepad_send(uint32_t b,
                       int32_t lx, int32_t ly,
                       int32_t rx, int32_t ry,
                       uint32_t lt, uint32_t rt) {
+    uint16_t dz = s_stick_deadzone;
+    if (dz > 0) {
+        apply_radial_deadzone(&lx, &ly, dz);
+        apply_radial_deadzone(&rx, &ry, dz);
+    }
+
     uint8_t btn2 = 0, btn3 = 0;
     if (b & (1u << 11)) btn2 |= 0x01; /* Capture */
     if (b & (1u << 10)) btn2 |= 0x02; /* Assistant */
@@ -589,6 +617,22 @@ bool usb_gamepad_save_mode(usb_gamepad_mode_t mode) {
     return err == ESP_OK;
 }
 
+void usb_gamepad_set_deadzone(uint16_t dz) {
+    if (dz > 8192u) dz = 8192u;
+    s_stick_deadzone = dz;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_USB, NVS_READWRITE, &h) == ESP_OK) {
+        if (nvs_set_u16(h, NVS_KEY_STICK_DZ, dz) == ESP_OK) {
+            (void)nvs_commit(h);
+        }
+        nvs_close(h);
+    }
+}
+
+uint16_t usb_gamepad_get_deadzone(void) {
+    return s_stick_deadzone;
+}
+
 void usb_gamepad_disconnect(void) {
     if (s_usb_installed) {
         tud_disconnect();
@@ -598,6 +642,15 @@ void usb_gamepad_disconnect(void) {
 void usb_gamepad_init(usb_rumble_cb_t rumble_cb) {
     s_rumble_cb = rumble_cb;
     s_mode = load_mode_from_nvs();
+    {
+        nvs_handle_t h;
+        uint16_t saved_dz = 0;
+        if (nvs_open(NVS_NS_USB, NVS_READONLY, &h) == ESP_OK) {
+            (void)nvs_get_u16(h, NVS_KEY_STICK_DZ, &saved_dz);
+            nvs_close(h);
+        }
+        if (saved_dz <= 8192u) s_stick_deadzone = saved_dz;
+    }
     usb_audio_init();
 
     const tinyusb_config_t tusb_cfg = (s_mode == USB_GAMEPAD_MODE_XINPUT)

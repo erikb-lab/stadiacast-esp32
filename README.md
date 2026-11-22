@@ -2,27 +2,37 @@
 
 Standalone Seeed XIAO ESP32-S3 Wi-Fi dongle that emulates Google's Stadia cloud
 endpoints (SoftAP, DNS sink, SNTP, HTTPS/GMsg, dual DTLS 1.2 + SRTP sessions on
-UDP 50000 & 50002, and Core-1 full-duplex 48 kHz Opus audio) and exposes your
-Stadia Controller over USB-C as a composite **Gamepad + Bidirectional USB Audio
-Headset**:
+UDP 50000 & 50002, and Core-1 event-driven full-duplex 48 kHz Opus audio) and
+exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
+(composite Gamepad + Bidirectional USB Audio Headset):
 
 - **Dual USB Gamepad Modes (1000 Hz + Rumble, switchable live from the controller)**:
-  - **Stadia HID Mode (`18d1:9400`, default):** Native Google Stadia Controller with all 17 buttons (including Assistant & Capture) and Report 5 rumble (`hid-google-stadiaff` on Linux, Steam Input, SDL2/SDL3, macOS, Android).
-  - **XInput Mode (`1209:9401`):** Xbox 360 XInput controller (`0xFF/0x5D/0x01` + MS OS 2.0 `XUSB10`) with native plug-and-play support & rumble on Windows (`xusb22.sys`) and Linux (`xpad`).
+  - **Stadia HID Mode (`18d1:9400`, default — `Stadia Wireless Adapter`):** Native Google Stadia Controller ID with all 17 buttons (including Assistant & Capture) and Report 5 rumble (`hid-google-stadiaff` on Linux, Steam Input, SDL2/SDL3, macOS, Android).
+  - **XInput Mode (`1209:9401` — `Stadia Wireless Adapter XInput`):** Xbox 360 XInput controller (`0xFF/0x5D/0x01` + MS OS 2.0 `XUSB10`) with native plug-and-play support & rumble on Windows (`xusb22.sys`) and Linux (`xpad`).
 - **Bidirectional USB Audio (UAC1) in Both Modes**:
   - **Headset Output (Speaker):** 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
   - **Headset Input (Mic):** controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
+  - **Hardware Mic Mute** & **Configurable Mic Gain** (`1.0x / 1.5x / 2.0x / 2.5x`, saved in NVS)
+- **Radial Stick Deadzone (`0% / 4% / 8%`, saved in NVS)** & **On-Board Status LED (`GPIO 21`)**
 
-## Switching USB Modes (Stadia HID ↔ XInput)
+## Controller Hotkeys
 
-Hold the button combo on your connected Stadia Controller for **2 seconds**:
+| Action | Button Combo | Haptic Confirmation |
+| :--- | :--- | :--- |
+| **Switch to Stadia HID (`18d1:9400`)** | Hold **Assistant + Capture + A** (2 s) | 1 long buzz, reboots (~4–5 s reconnect) |
+| **Switch to XInput (`1209:9401`)** | Hold **Assistant + Capture + X** (2 s) | 2 long buzzes, reboots (~4–5 s reconnect) |
+| **Toggle Mic Mute** | Tap **Assistant** *(XInput)* or **Assistant + Capture** *(both modes)* | 1 short buzz = muted, 2 quick taps = unmuted |
+| **Mic Gain Up / Down** | Hold **Assistant + Capture** + tap **D-Pad Up / Down** | 1–4 quick taps (`1.0x / 1.5x / 2.0x / 2.5x`) |
+| **Cycle Stick Deadzone** | Hold **Assistant + Capture** + tap **D-Pad Right** | 1–3 quick taps (`0% / 4% / 8%`) |
 
-| Combo (hold 2 s) | USB Mode | Confirmation | Best For |
-| :--- | :--- | :--- | :--- |
-| **Assistant + Capture + A** | **Stadia HID (`18d1:9400`)** | 1 rumble pulse | Linux, macOS, Steam Deck, Android, Steam Input (all 17 buttons) |
-| **Assistant + Capture + X** | **XInput (`1209:9401`)** | 2 rumble pulses | Windows (Game Pass, standalone games, universal XInput) & Linux `xpad` |
+All settings (USB mode, mic gain, and stick deadzone) persist across reboots in NVS flash.
 
-The chosen mode is saved in flash (NVS) across power cycles. After switching, the dongle reboots (~0.5 s) and the controller reconnects over Wi-Fi within ~10–15 seconds (or immediately if you power-cycle the controller).
+## Status LED (XIAO Orange User LED)
+
+- **Slow heartbeat (100 ms / 1 s):** Waiting for Stadia Controller
+- **Solid ON:** Controller connected & mic active
+- **Steady blink (500 ms):** Controller connected & **mic muted**
+- **Fast blink (100 ms):** Holding a 2 s mode-switch combo
 
 ## Hardware
 
@@ -35,7 +45,7 @@ The chosen mode is saved in flash (NVS) across power cycles. After switching, th
 
 ## Flashing Pre-Built Firmware
 
-Download `stadiacast-esp32-v1.2.0-merged.bin` from the
+Download `stadiacast-esp32-v1.3.0-merged.bin` from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -52,7 +62,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.2.0-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.3.0-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -72,7 +82,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.2.0-merged.bin
+  0x0 stadiacast-esp32-v1.3.0-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -91,7 +101,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.2.0-merged.bin
+  0x0 stadiacast-esp32-v1.3.0-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -108,7 +118,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.2.0-merged.bin
+  0x0 stadiacast-esp32-v1.3.0-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:
@@ -119,7 +129,7 @@ aplay -l
 arecord -l
 ```
 
-You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** (or **`1209:9401`** in XInput mode) plus both a playback and capture audio device.
+You should see **`18d1:9400`** (**`Stadia Wireless Adapter`**) or **`1209:9401`** (**`Stadia Wireless Adapter XInput`**) plus both a playback and capture audio device.
 
 ---
 
@@ -127,8 +137,8 @@ You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** (or **`1209:
 
 1. Plug the flashed XIAO ESP32-S3 into your Windows, macOS, or Linux host.
 2. Provision your Wi-Fi Stadia Controller to the SoftAP **`STADIA_ESP32`** (password: **`stadiacast`**) if it is not already linked.
-3. Turn on the Stadia Controller. Within ~4–6 seconds it will connect and turn solid white.
-4. Plug a 3.5 mm headset into the controller and select **`Stadia Controller rev. A`** (or **`Stadia Controller (XInput)`**) as your OS audio output and/or input device.
+3. Turn on the Stadia Controller. Within ~4–6 seconds it will connect and turn solid white (the XIAO orange LED turns solid).
+4. Plug a 3.5 mm headset into the controller and select **`Stadia Wireless Adapter`** as your OS audio output and/or input device.
 
 ---
 

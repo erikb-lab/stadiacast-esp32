@@ -1,6 +1,7 @@
 /* Phase 3-5: Display Link (UDP 50000) + Game Session Rumble (UDP 50002). */
 #include "stadia_transport.h"
 #include "usb_gamepad.h"
+#include "usb_audio.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -12,9 +13,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "lwip/inet.h"
 #include "lwip/sockets.h"
 
@@ -1263,7 +1267,76 @@ static void service_timers(dtls_link_t *L) {
     }
 }
 
+/* On-board XIAO ESP32-S3 orange user LED (GPIO 21, active-LOW) */
+#define STATUS_LED_GPIO GPIO_NUM_21
+
+static void status_led_init(void) {
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << STATUS_LED_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io);
+    gpio_set_level(STATUS_LED_GPIO, 1); /* OFF (active-low) */
+}
+
+static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool combo_held) {
+    static int s_last_level = -1;
+    bool on;
+    if (combo_held) {
+        on = ((now_us / 100000) & 1) == 0; /* Fast 100ms blink while holding mode combo */
+    } else if (!ready) {
+        on = (now_us % 1000000) < 100000;  /* Slow heartbeat: 100ms ON / 900ms OFF */
+    } else if (mic_muted) {
+        on = ((now_us / 500000) & 1) == 0; /* 500ms blink when connected & mic muted */
+    } else {
+        on = true;                         /* Solid ON when connected & mic active */
+    }
+    int level = on ? 0 : 1; /* Active-LOW */
+    if (level != s_last_level) {
+        gpio_set_level(STATUS_LED_GPIO, level);
+        s_last_level = level;
+    }
+}
+
+/* Non-blocking local haptic pulse overlay (never blocks UDP/audio/input) */
+static int      s_haptic_pulses_left = 0;
+static bool     s_haptic_on = false;
+static uint16_t s_haptic_strength = 0;
+static int64_t  s_haptic_next_us = 0;
+
+static void haptic_start(int pulses, uint16_t strength) {
+    if (pulses <= 0 || !g_game.handshake_done) return;
+    s_haptic_pulses_left = pulses;
+    s_haptic_strength = strength;
+    s_haptic_on = true;
+    s_haptic_next_us = esp_timer_get_time() + 75000; /* 75 ms ON */
+    send_game_rumble(strength, strength);
+}
+
+static void haptic_tick(int64_t now_us) {
+    if (s_haptic_pulses_left <= 0) return;
+    if (now_us < s_haptic_next_us) return;
+    if (s_haptic_on) {
+        s_haptic_on = false;
+        s_haptic_pulses_left--;
+        if (g_game.handshake_done) send_game_rumble(0, 0);
+        if (s_haptic_pulses_left > 0) {
+            s_haptic_next_us = now_us + 75000; /* 75 ms gap */
+        } else {
+            g_rumble_dirty = true; /* Restore host rumble state */
+        }
+    } else {
+        s_haptic_on = true;
+        s_haptic_next_us = now_us + 75000;
+        if (g_game.handshake_done) send_game_rumble(s_haptic_strength, s_haptic_strength);
+    }
+}
+
 static void stadia_transport_task(void *arg) {
+    status_led_init();
     stadia_opus_init();
     (void)arg;
     g_wake_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1318,39 +1391,109 @@ static void stadia_transport_task(void *arg) {
             }
         }
 
-        /* Game session rumble: send immediately on change, refresh every 2s while active */
-        if (g_game.handshake_done) {
-            int64_t now = esp_timer_get_time();
-            uint16_t rl = g_rumble_left_req;
-            uint16_t rr = g_rumble_right_req;
-            bool changed = g_rumble_dirty || rl != g_rumble_left_sent || rr != g_rumble_right_sent;
-            bool refresh = (rl > 0 || rr > 0) && ((now - g_last_rumble_tx_us) >= 2000000);
-            if (changed || refresh) {
-                g_rumble_dirty = false;
-                send_game_rumble(rl, rr);
+        /* Game session rumble: non-blocking haptic overlay or host rumble */
+        {
+            int64_t now_r = esp_timer_get_time();
+            haptic_tick(now_r);
+            if (g_game.handshake_done && s_haptic_pulses_left <= 0) {
+                uint16_t rl = g_rumble_left_req;
+                uint16_t rr = g_rumble_right_req;
+                bool changed = g_rumble_dirty || rl != g_rumble_left_sent || rr != g_rumble_right_sent;
+                bool refresh = (rl > 0 || rr > 0) && ((now_r - g_last_rumble_tx_us) >= 2000000);
+                if (changed || refresh) {
+                    g_rumble_dirty = false;
+                    send_game_rumble(rl, rr);
+                }
             }
         }
 
-        /* Controller mode-switch combo (hold 2s):
-         *   Assistant (bit10) + Capture (bit11) + A (bit12) -> Stadia HID (1 buzz)
-         *   Assistant (bit10) + Capture (bit11) + X (bit14) -> XInput     (2 buzzes) */
+        /* Controller hotkeys & mode switching:
+         *   Hold 2s: Assistant + Capture + A -> Stadia HID (1 buzz, fast deauth reboot)
+         *   Hold 2s: Assistant + Capture + X -> XInput     (2 buzzes, fast deauth reboot)
+         *   Tap:     Assistant (XInput mode) OR Assistant + Capture (any mode) -> Mic mute toggle
+         *   Tap:     Assistant + Capture + D-Pad Up / Down  -> Mic gain 1.0x / 1.5x / 2.0x / 2.5x
+         *   Tap:     Assistant + Capture + D-Pad Right      -> Stick deadzone 0% / 4% / 8% */
         {
-            const uint32_t combo_base   = (1u << 10) | (1u << 11);
-            const uint32_t combo_stadia = combo_base | (1u << 12);
-            const uint32_t combo_xinput = combo_base | (1u << 14);
-            static int64_t s_combo_start_us = 0;
-            static uint32_t s_combo_active = 0;
+            const uint32_t btn_up     = (1u << 0);
+            const uint32_t btn_down   = (1u << 1);
+            const uint32_t btn_right  = (1u << 3);
+            const uint32_t btn_asst   = (1u << 10);
+            const uint32_t btn_cap    = (1u << 11);
+            const uint32_t btn_a      = (1u << 12);
+            const uint32_t btn_x      = (1u << 14);
+            const uint32_t combo_base = btn_asst | btn_cap;
+            const uint32_t combo_stadia = combo_base | btn_a;
+            const uint32_t combo_xinput = combo_base | btn_x;
 
+            static int64_t  s_combo_start_us = 0;
+            static uint32_t s_combo_active = 0;
+            static uint32_t s_prev_btn = 0;
+            static int64_t  s_asst_down_us = 0;
+            static bool     s_asst_chord_used = false;
+            static bool     s_both_down = false;
+
+            int64_t now = esp_timer_get_time();
             uint32_t cur = g_last_set ? g_last_buttons : 0;
+            uint32_t rising = cur & ~s_prev_btn;
+
+            /* Track Assistant press lifecycle so holding combos never triggers a mute tap */
+            if (cur & btn_asst) {
+                if (!(s_prev_btn & btn_asst)) {
+                    s_asst_down_us = now;
+                    s_asst_chord_used = false;
+                    s_both_down = false;
+                }
+                if (cur & btn_cap) s_both_down = true;
+                if (cur & ~(btn_asst | btn_cap)) s_asst_chord_used = true;
+            } else if (s_prev_btn & btn_asst) {
+                /* Assistant released: quick tap (<600ms) with no other action button = mic mute toggle */
+                bool allow_mute = s_both_down || (usb_gamepad_get_mode() == USB_GAMEPAD_MODE_XINPUT);
+                if (allow_mute && !s_asst_chord_used && (now - s_asst_down_us) < 600000) {
+                    bool muted = !usb_audio_is_mic_muted();
+                    usb_audio_set_mic_muted(muted);
+                    ESP_LOGI(TAG, "Mic %s", muted ? "MUTED" : "UNMUTED");
+                    haptic_start(muted ? 1 : 2, muted ? 0x6000 : 0x9000);
+                }
+                s_both_down = false;
+                s_asst_chord_used = false;
+            }
+
+            /* Instant combo taps while holding Assistant + Capture */
+            if ((cur & combo_base) == combo_base) {
+                if (rising & (btn_up | btn_down)) {
+                    static const uint16_t k_gains[] = { 256, 384, 512, 640 }; /* 1.0x, 1.5x, 2.0x, 2.5x */
+                    uint16_t g = stadia_opus_get_mic_gain_q8();
+                    int idx = 0;
+                    for (int i = 0; i < 4; i++) {
+                        if (g >= k_gains[i]) idx = i;
+                    }
+                    if ((rising & btn_up) && idx < 3) idx++;
+                    else if ((rising & btn_down) && idx > 0) idx--;
+                    stadia_opus_set_mic_gain_q8(k_gains[idx]);
+                    ESP_LOGI(TAG, "Mic gain -> %u.%ux", k_gains[idx] / 256u, ((k_gains[idx] % 256u) * 10u) / 256u);
+                    haptic_start(idx + 1, 0x7000);
+                    s_asst_chord_used = true;
+                } else if (rising & btn_right) {
+                    static const uint16_t k_dz[] = { 0, 1310, 2621 }; /* 0%, 4%, 8% */
+                    uint16_t dz = usb_gamepad_get_deadzone();
+                    int idx = (dz == 0) ? 1 : (dz <= 1310 ? 2 : 0);
+                    usb_gamepad_set_deadzone(k_dz[idx]);
+                    ESP_LOGI(TAG, "Stick deadzone -> %u%%", (unsigned)(idx * 4));
+                    haptic_start(idx + 1, 0x7000);
+                    s_asst_chord_used = true;
+                }
+            }
+
+            /* 2-second hold combos for USB mode switch */
             uint32_t matched = 0;
-            if ((cur & combo_stadia) == combo_stadia && !(cur & (1u << 14))) {
+            if ((cur & combo_stadia) == combo_stadia && !(cur & btn_x)) {
                 matched = combo_stadia;
-            } else if ((cur & combo_xinput) == combo_xinput && !(cur & (1u << 12))) {
+            } else if ((cur & combo_xinput) == combo_xinput && !(cur & btn_a)) {
                 matched = combo_xinput;
             }
 
             if (matched != 0) {
-                int64_t now = esp_timer_get_time();
+                s_asst_chord_used = true;
                 if (s_combo_active != matched) {
                     s_combo_active = matched;
                     s_combo_start_us = now;
@@ -1368,14 +1511,21 @@ static void stadia_transport_task(void *arg) {
                         if (g_game.handshake_done) send_game_rumble(0, 0);
                         vTaskDelay(pdMS_TO_TICKS(150));
                     }
+                    /* Deauth STA cleanly so Stadia controller reconnects in ~4-5s instead of 15s */
+                    (void)esp_wifi_deauth_sta(0);
+                    vTaskDelay(pdMS_TO_TICKS(50));
+                    (void)esp_wifi_stop();
                     usb_gamepad_disconnect();
-                    vTaskDelay(pdMS_TO_TICKS(150));
+                    vTaskDelay(pdMS_TO_TICKS(100));
                     esp_restart();
                 }
             } else {
                 s_combo_active = 0;
                 s_combo_start_us = 0;
             }
+
+            s_prev_btn = cur;
+            status_led_update(now, g_rpc_ready, usb_audio_is_mic_muted(), s_combo_active != 0);
         }
 
         service_audio_tx();

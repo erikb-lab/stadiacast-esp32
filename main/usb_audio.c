@@ -33,6 +33,7 @@ static atomic_uint_fast8_t  s_spk_alt = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast8_t  s_mic_alt = ATOMIC_VAR_INIT(0);
 static atomic_bool          s_spk_flush = ATOMIC_VAR_INIT(false);
 static atomic_bool          s_mic_primed = ATOMIC_VAR_INIT(false);
+static atomic_bool          s_mic_muted = ATOMIC_VAR_INIT(false);
 
 static atomic_uint_fast32_t s_rx_cb_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_rx_bytes_total = ATOMIC_VAR_INIT(0);
@@ -118,7 +119,9 @@ static void push_mic_tx_1ms(void) {
             (void)stadia_opus_read_mic_pcm(&discard, 1u);
         }
         size_t got = stadia_opus_read_mic_pcm(pcm, SAMPLES_1MS);
-        if (got < SAMPLES_1MS) {
+        if (atomic_load_explicit(&s_mic_muted, memory_order_relaxed)) {
+            memset(pcm, 0, sizeof(pcm));
+        } else if (got < SAMPLES_1MS) {
             memset(pcm + got, 0, (SAMPLES_1MS - got) * sizeof(int16_t));
         }
     } else {
@@ -161,6 +164,14 @@ bool usb_audio_spk_active(void) {
 
 bool usb_audio_mic_active(void) {
     return atomic_load_explicit(&s_mic_alt, memory_order_acquire) != 0;
+}
+
+void usb_audio_set_mic_muted(bool muted) {
+    atomic_store_explicit(&s_mic_muted, muted, memory_order_release);
+}
+
+bool usb_audio_is_mic_muted(void) {
+    return atomic_load_explicit(&s_mic_muted, memory_order_acquire);
 }
 
 size_t usb_audio_read_spk_pcm(int16_t *stereo_out, size_t max_frames) {

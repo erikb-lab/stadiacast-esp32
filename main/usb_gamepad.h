@@ -15,6 +15,8 @@ typedef void (*usb_rumble_cb_t)(uint16_t left_strong, uint16_t right_weak);
 void               usb_gamepad_init(usb_rumble_cb_t rumble_cb);
 usb_gamepad_mode_t usb_gamepad_get_mode(void);
 bool               usb_gamepad_save_mode(usb_gamepad_mode_t mode);
+void               usb_gamepad_set_deadzone(uint16_t dz);
+uint16_t           usb_gamepad_get_deadzone(void);
 void               usb_gamepad_disconnect(void);
 
 void usb_gamepad_send(uint32_t stadia_buttons,
