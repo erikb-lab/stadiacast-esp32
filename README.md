@@ -2,15 +2,27 @@
 
 Standalone Seeed XIAO ESP32-S3 Wi-Fi dongle that emulates Google's Stadia cloud
 endpoints (SoftAP, DNS sink, SNTP, HTTPS/GMsg, dual DTLS 1.2 + SRTP sessions on
-UDP 50000 & 50002, and Core-1 full-duplex 48 kHz Opus audio) and exposes the
-Stadia Controller over USB-C as a native composite **Google Stadia Controller
-(`18d1:9400`)**:
+UDP 50000 & 50002, and Core-1 full-duplex 48 kHz Opus audio) and exposes your
+Stadia Controller over USB-C as a composite **Gamepad + Bidirectional USB Audio
+Headset**:
 
-- **1000 Hz USB HID Gamepad**: full 17-button + dual-stick + analog trigger support
-- **Rumble Feedback**: `hid-google-stadiaff` / HID Report 5 dual-motor vibration
-- **Bidirectional USB Audio (UAC1)**:
-  - **Headset Output (Speaker)**: 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
-  - **Headset Input (Mic)**: controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
+- **Dual USB Gamepad Modes (1000 Hz + Rumble, switchable live from the controller)**:
+  - **Stadia HID Mode (`18d1:9400`, default):** Native Google Stadia Controller with all 17 buttons (including Assistant & Capture) and Report 5 rumble (`hid-google-stadiaff` on Linux, Steam Input, SDL2/SDL3, macOS, Android).
+  - **XInput Mode (`1209:9401`):** Xbox 360 XInput controller (`0xFF/0x5D/0x01` + MS OS 2.0 `XUSB10`) with native plug-and-play support & rumble on Windows (`xusb22.sys`) and Linux (`xpad`).
+- **Bidirectional USB Audio (UAC1) in Both Modes**:
+  - **Headset Output (Speaker):** 48 kHz, 16-bit Stereo PCM → Opus → SRTP → controller 3.5 mm jack
+  - **Headset Input (Mic):** controller 3.5 mm mic → SRTP → Opus → 48 kHz, 16-bit Mono PCM
+
+## Switching USB Modes (Stadia HID ↔ XInput)
+
+Hold the button combo on your connected Stadia Controller for **2 seconds**:
+
+| Combo (hold 2 s) | USB Mode | Confirmation | Best For |
+| :--- | :--- | :--- | :--- |
+| **Assistant + Capture + A** | **Stadia HID (`18d1:9400`)** | 1 rumble pulse | Linux, macOS, Steam Deck, Android, Steam Input (all 17 buttons) |
+| **Assistant + Capture + X** | **XInput (`1209:9401`)** | 2 rumble pulses | Windows (Game Pass, standalone games, universal XInput) & Linux `xpad` |
+
+The chosen mode is saved in flash (NVS) across power cycles. After switching, the dongle reboots (~0.5 s) and the controller reconnects over Wi-Fi within ~10–15 seconds (or immediately if you power-cycle the controller).
 
 ## Hardware
 
@@ -23,12 +35,12 @@ Stadia Controller over USB-C as a native composite **Google Stadia Controller
 
 ## Flashing Pre-Built Firmware
 
-Download `stadiacast-esp32-v1.0.0-merged.bin` from the
+Download `stadiacast-esp32-v1.1.0-merged.bin` from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
 
-Because the firmware switches USB-C into HID + Audio mode on normal boot, put the XIAO ESP32-S3 into ROM bootloader mode before flashing:
+Because the firmware switches USB-C into Gamepad + Audio mode on normal boot, put the XIAO ESP32-S3 into ROM bootloader mode before flashing:
 
 1. Hold the **`B` (BOOT)** button on the XIAO ESP32-S3.
 2. While holding `B`, plug the USB-C cable into your computer (or tap **`R` (RESET)** if already plugged in).
@@ -40,7 +52,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.0.0-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.1.0-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -60,7 +72,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.0.0-merged.bin
+  0x0 stadiacast-esp32-v1.1.0-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -79,7 +91,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.0.0-merged.bin
+  0x0 stadiacast-esp32-v1.1.0-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -96,18 +108,18 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.0.0-merged.bin
+  0x0 stadiacast-esp32-v1.1.0-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:
 
 ```sh
-lsusb -d 18d1:9400
+lsusb | grep -E "18d1:9400|1209:9401"
 aplay -l
 arecord -l
 ```
 
-You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** plus both a playback and capture audio device.
+You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** (or **`1209:9401`** in XInput mode) plus both a playback and capture audio device.
 
 ---
 
@@ -116,7 +128,7 @@ You should see **`18d1:9400 Google Inc. Stadia Controller rev. A`** plus both a 
 1. Plug the flashed XIAO ESP32-S3 into your Windows, macOS, or Linux host.
 2. Provision your Wi-Fi Stadia Controller to the SoftAP **`STADIA_ESP32`** (password: **`stadiacast`**) if it is not already linked.
 3. Turn on the Stadia Controller. Within ~4–6 seconds it will connect and turn solid white.
-4. Plug a 3.5 mm headset into the controller and select **`Stadia Controller rev. A`** as your OS audio output and/or input device.
+4. Plug a 3.5 mm headset into the controller and select **`Stadia Controller rev. A`** (or **`Stadia Controller (XInput)`**) as your OS audio output and/or input device.
 
 ---
 

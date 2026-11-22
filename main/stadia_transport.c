@@ -1324,6 +1324,53 @@ static void stadia_transport_task(void *arg) {
             }
         }
 
+        /* Controller mode-switch combo (hold 2s):
+         *   Assistant (bit10) + Capture (bit11) + A (bit12) -> Stadia HID (1 buzz)
+         *   Assistant (bit10) + Capture (bit11) + X (bit14) -> XInput     (2 buzzes) */
+        {
+            const uint32_t combo_base   = (1u << 10) | (1u << 11);
+            const uint32_t combo_stadia = combo_base | (1u << 12);
+            const uint32_t combo_xinput = combo_base | (1u << 14);
+            static int64_t s_combo_start_us = 0;
+            static uint32_t s_combo_active = 0;
+
+            uint32_t cur = g_last_set ? g_last_buttons : 0;
+            uint32_t matched = 0;
+            if ((cur & combo_stadia) == combo_stadia && !(cur & (1u << 14))) {
+                matched = combo_stadia;
+            } else if ((cur & combo_xinput) == combo_xinput && !(cur & (1u << 12))) {
+                matched = combo_xinput;
+            }
+
+            if (matched != 0) {
+                int64_t now = esp_timer_get_time();
+                if (s_combo_active != matched) {
+                    s_combo_active = matched;
+                    s_combo_start_us = now;
+                } else if ((now - s_combo_start_us) >= 2000000) {
+                    usb_gamepad_mode_t target = (matched == combo_xinput)
+                                                ? USB_GAMEPAD_MODE_XINPUT
+                                                : USB_GAMEPAD_MODE_STADIA_HID;
+                    int pulses = (target == USB_GAMEPAD_MODE_XINPUT) ? 2 : 1;
+                    ESP_LOGI(TAG, "Mode combo triggered -> switching USB mode to %s",
+                             (target == USB_GAMEPAD_MODE_XINPUT) ? "XInput" : "Stadia HID");
+                    (void)usb_gamepad_save_mode(target);
+                    for (int p = 0; p < pulses; p++) {
+                        if (g_game.handshake_done) send_game_rumble(0xB000, 0xB000);
+                        vTaskDelay(pdMS_TO_TICKS(150));
+                        if (g_game.handshake_done) send_game_rumble(0, 0);
+                        vTaskDelay(pdMS_TO_TICKS(150));
+                    }
+                    usb_gamepad_disconnect();
+                    vTaskDelay(pdMS_TO_TICKS(150));
+                    esp_restart();
+                }
+            } else {
+                s_combo_active = 0;
+                s_combo_start_us = 0;
+            }
+        }
+
         service_audio_tx();
         usb_gamepad_keepalive_tick();
     }
