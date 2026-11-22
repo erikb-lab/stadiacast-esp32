@@ -73,6 +73,9 @@ extern const char fullchain_pem_end[]   asm("_binary_fullchain_pem_end");
 extern const char privkey_pem_start[]   asm("_binary_privkey_pem_start");
 extern const char privkey_pem_end[]     asm("_binary_privkey_pem_end");
 
+#include "stadia_srtp.h"
+#include "stadia_opus.h"
+
 typedef struct {
     int64_t int_ms;
     int64_t fin_ms;
@@ -99,6 +102,7 @@ typedef struct {
     int64_t     dtls_done_us;
     int64_t     last_stun_tx_us;
     bool        first_stun_logged;
+    stadia_srtp_ctx_t srtp;
 } dtls_link_t;
 
 /* Shared mbedTLS config/cert/RNG */
@@ -136,6 +140,16 @@ static bool g_rpc_ready;
 static bool g_start_game_sent;
 static int64_t g_last_state_req_us;
 static uint32_t g_rpc_ticket;
+
+/* Phase 6A: SRTP bidirectional audio state */
+static bool     g_audio_enabled;
+static int64_t  g_audio_next_tx_us;
+static uint16_t g_audio_seq;
+static uint32_t g_audio_ts;
+static uint32_t g_audio_tx_pkts;
+static uint32_t g_mic_rx_pkts;
+static uint32_t g_mic_rx_bytes;
+static uint8_t  g_audio_tx_buf[512];
 
 /* Game session rumble state */
 static volatile uint16_t g_rumble_left_req;
@@ -465,6 +479,8 @@ static bool link_init(dtls_link_t *L) {
     mbedtls_ssl_set_mtu(&L->ssl, 1200);
     mbedtls_ssl_set_bio(&L->ssl, L, dtls_bio_send, dtls_bio_recv, NULL);
     mbedtls_ssl_set_timer_cb(&L->ssl, &L->timer, dtls_set_timer, dtls_get_timer);
+    stadia_srtp_init(&L->srtp);
+    mbedtls_ssl_set_export_keys_cb(&L->ssl, stadia_srtp_export_cb, &L->srtp);
 
     L->sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (L->sock < 0) return false;
@@ -482,6 +498,12 @@ static bool link_init(dtls_link_t *L) {
 
 static void link_reset(dtls_link_t *L) {
     mbedtls_ssl_session_reset(&L->ssl);
+    stadia_srtp_free(&L->srtp);
+    mbedtls_ssl_set_export_keys_cb(&L->ssl, stadia_srtp_export_cb, &L->srtp);
+    if (L == &g_disp) {
+        g_audio_enabled = false;
+        g_audio_next_tx_us = 0;
+    }
     mbedtls_ssl_set_mtu(&L->ssl, 1200);
     L->timer.active = false;
     L->rx_len = 0;
@@ -578,6 +600,78 @@ static void send_start_game_request(void) {
         ESP_LOGI(TAG, "Sent StartGame (key=%s) for rumble channel", GAME_KEY);
     }
     free(dtc);
+}
+
+static void send_set_audio_mode(uint32_t mode, bool f3) {
+    gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
+    if (!dtc) return;
+    dtc->has_set_audio_mode = true;
+    dtc->set_audio_mode.has_mode = true;
+    dtc->set_audio_mode.mode = mode;
+    dtc->set_audio_mode.has_f3 = true;
+    dtc->set_audio_mode.f3 = f3;
+    uint8_t buf[64];
+    pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
+        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
+        ESP_LOGI(TAG, "Sent SetAudioMode(mode=%lu, f3=%d)", (unsigned long)mode, f3 ? 1 : 0);
+    }
+    free(dtc);
+}
+
+static void send_set_microphone(bool enable) {
+    gotham_display_DisplayToController *dtc = calloc(1, sizeof(*dtc));
+    if (!dtc) return;
+    dtc->has_set_microphone = true;
+    dtc->set_microphone.has_value = true;
+    dtc->set_microphone.value = enable;
+    uint8_t buf[64];
+    pb_ostream_t os = pb_ostream_from_buffer(buf, sizeof(buf));
+    if (pb_encode(&os, gotham_display_DisplayToController_fields, dtc)) {
+        link_send_rpc_request(&g_disp, WIRE_ID_RPC_DISPLAY, ++g_rpc_ticket, buf, os.bytes_written);
+        ESP_LOGI(TAG, "Sent SetMicrophone(%d)", enable ? 1 : 0);
+    }
+    free(dtc);
+}
+
+static void service_audio_tx(void) {
+    if (!g_audio_enabled || !g_disp.srtp.keys_ready || !g_disp.peer_seen) return;
+
+    uint8_t opus_pkt[STADIA_MAX_OPUS_PKT_BYTES];
+    size_t flen = 0;
+    while (stadia_opus_pop_tx_packet(opus_pkt, sizeof(opus_pkt), &flen)) {
+        if (flen == 0 || 12u + flen + STADIA_SRTP_TAG_LEN > sizeof(g_audio_tx_buf)) continue;
+
+        int64_t now = esp_timer_get_time();
+        bool marker = (g_audio_tx_pkts == 0) || (g_audio_next_tx_us != 0 && (now - g_audio_next_tx_us) > 200000);
+        g_audio_next_tx_us = now;
+
+        uint16_t seq = g_audio_seq++;
+        uint32_t ts  = g_audio_ts;
+        g_audio_ts += 960; /* 20ms @ 48kHz */
+        const uint32_t ssrc = 0x51A01234u;
+
+        g_audio_tx_buf[0] = 0x80;
+        g_audio_tx_buf[1] = marker ? (uint8_t)(0x80 | 111) : 111;
+        g_audio_tx_buf[2] = (uint8_t)(seq >> 8);
+        g_audio_tx_buf[3] = (uint8_t)(seq & 0xFF);
+        g_audio_tx_buf[4] = (uint8_t)(ts >> 24);
+        g_audio_tx_buf[5] = (uint8_t)(ts >> 16);
+        g_audio_tx_buf[6] = (uint8_t)(ts >> 8);
+        g_audio_tx_buf[7] = (uint8_t)(ts & 0xFF);
+        g_audio_tx_buf[8] = (uint8_t)(ssrc >> 24);
+        g_audio_tx_buf[9] = (uint8_t)(ssrc >> 16);
+        g_audio_tx_buf[10] = (uint8_t)(ssrc >> 8);
+        g_audio_tx_buf[11] = (uint8_t)(ssrc & 0xFF);
+        memcpy(g_audio_tx_buf + 12, opus_pkt, flen);
+
+        size_t srtp_len = 0;
+        if (stadia_srtp_protect(&g_disp.srtp, g_audio_tx_buf, 12u + flen, &srtp_len)) {
+            sendto(g_disp.sock, g_audio_tx_buf, srtp_len, 0,
+                   (const struct sockaddr *)&g_disp.peer, sizeof(g_disp.peer));
+            g_audio_tx_pkts++;
+        }
+    }
 }
 
 /* ---------- Game Session: ProxyRequest -> ProxyResponse + Rumble TX ---------- */
@@ -832,6 +926,12 @@ static void handle_disp_rpc_response(const gotham_rpc_RpcResponse *resp) {
         g_rpc_ready = true;
         ESP_LOGI(TAG, "===== READY! Starting game session for rumble =====");
         if (!g_start_game_sent) send_start_game_request();
+        if (!g_audio_enabled) {
+            send_set_audio_mode(2, true);
+            send_set_microphone(true);
+            g_audio_enabled = true;
+            g_audio_next_tx_us = 0;
+        }
     }
     free(ctd);
 }
@@ -1121,6 +1221,25 @@ static void service_socket(dtls_link_t *L) {
         memcpy(L->rx_buf, g_udp_buf, (size_t)n);
         L->rx_len = (size_t)n;
         pump_dtls(L);
+    } else if (b0 >= 128 && b0 <= 191 && L == &g_disp && L->srtp.keys_ready) {
+        uint8_t pt = g_udp_buf[1] & 0x7Fu;
+        if (pt < 64 || pt > 95) { /* RTP (skip RTCP 72..76) */
+            size_t rtp_len = 0;
+            if (stadia_srtp_unprotect(&L->srtp, g_udp_buf, (size_t)n, &rtp_len) &&
+                rtp_len > 12 && pt == 111) {
+                size_t hlen = 12u + 4u * (g_udp_buf[0] & 0x0Fu);
+                if ((g_udp_buf[0] & 0x10u) && hlen + 4u <= rtp_len) {
+                    uint16_t ext_w = (uint16_t)((g_udp_buf[hlen + 2] << 8) | g_udp_buf[hlen + 3]);
+                    hlen += 4u + 4u * ext_w;
+                }
+                if (rtp_len > hlen) {
+                    size_t plen = rtp_len - hlen;
+                    g_mic_rx_pkts++;
+                    g_mic_rx_bytes += (uint32_t)plen;
+                    stadia_opus_push_rx_packet(g_udp_buf + hlen, plen);
+                }
+            }
+        }
     }
 }
 
@@ -1139,6 +1258,7 @@ static void service_timers(dtls_link_t *L) {
 }
 
 static void stadia_transport_task(void *arg) {
+    stadia_opus_init();
     (void)arg;
     g_wake_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (!tls_init_shared() || !link_init(&g_disp) || !link_init(&g_game)) {
@@ -1171,7 +1291,7 @@ static void stadia_transport_task(void *arg) {
         FD_ZERO(&rfds);
         FD_SET(g_disp.sock, &rfds);
         FD_SET(g_game.sock, &rfds);
-        struct timeval tv = { .tv_sec = 0, .tv_usec = 50000 }; /* 50 ms idle tick; rumble wakes immediately */
+        struct timeval tv = { .tv_sec = 0, .tv_usec = (g_audio_enabled && g_disp.srtp.keys_ready) ? 4000 : 50000 };
         int r = select(maxfd, &rfds, NULL, NULL, &tv);
         if (r > 0) {
             if (FD_ISSET(g_disp.sock, &rfds)) service_socket(&g_disp);
@@ -1204,6 +1324,7 @@ static void stadia_transport_task(void *arg) {
             }
         }
 
+        service_audio_tx();
         usb_gamepad_keepalive_tick();
     }
 }
