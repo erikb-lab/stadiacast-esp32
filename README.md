@@ -27,6 +27,9 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
   - Dual 3 MB OTA partitions with automatic rollback protection.
   - Built-in **Live Controller Visualizer** (real-time sticks, analog triggers, buttons, and rumble tester) plus **live controller Wi-Fi RSSI (dBm)** and DRAM/PSRAM usage telemetry via `/api/input` & `/api/status`.
   - Configure USB mode, 1–4 player mode, mic mute/gain, stick deadzone, Wi-Fi TX power (`+8` to `+20 dBm`), custom SoftAP SSID/password, and upload firmware `.bin` files right from any browser — or save your Home Wi-Fi for 1-button GitHub/LAN Auto-OTA (**Assistant + Capture + B**).
+- **Low-Latency 125 Hz Wireless Polling (`v1.8.6`):**
+  - Automatically sends `DisplayToController.focus_game` once the Game Session DTLS link connects, switching the Stadia Controller from the 20 Hz (`50 ms`) menu Display Link onto its native high-rate Game Session input stream (`0x66` `GamepadMessage_V2`) with full sparse-delta state merging and proper sequence ACKs.
+  - **Measured over Linux `evdev` (5 s continuous sweep):** **8.00 ms median interval (125 Hz)**, `2–5 ms` min, `~100 Hz` sustained update rate, `~6 ms` jitter (vs `4.00 ms` / 250 Hz wired USB-C, and a **5× improvement** over 20 Hz Display Link / typical Stadia BLE).
 - **Wireless Range (Real-World Tested):**
   - **Seeed Studio XIAO ESP32-S3 (stock U.FL stick-on antenna, `+20 dBm`):** Stable up to **~30 ft (~9 m)**. Use a higher-gain external 2.4 GHz U.FL antenna if you need longer range.
 - **Live Controller Battery Reporting**:
@@ -105,7 +108,7 @@ Open the **[Stadia Wireless Adapter Web Flasher](https://erikb-lab.github.io/sta
 
 ### Manual Download (`esptool` CLI)
 
-Download `stadiacast-esp32-v1.8.5-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
+Download `stadiacast-esp32-v1.8.6-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -122,7 +125,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.8.5-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.8.6-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -142,7 +145,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.8.5-merged.bin
+  0x0 stadiacast-esp32-v1.8.6-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -161,7 +164,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.8.5-merged.bin
+  0x0 stadiacast-esp32-v1.8.6-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -178,7 +181,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.8.5-merged.bin
+  0x0 stadiacast-esp32-v1.8.6-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:

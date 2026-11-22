@@ -135,6 +135,7 @@ typedef struct {
 
     bool        rpc_ready;
     bool        start_game_sent;
+    bool        focus_game_sent;
     int64_t     last_state_req_us;
     uint32_t    rpc_ticket;
 
@@ -145,7 +146,10 @@ typedef struct {
     uint16_t    rumble_right_sent;
     int64_t     last_rumble_tx_us;
     uint64_t    game_tx_seq;
+    uint64_t    game_last_rx_seq;
+    uint64_t    game_last_ts_us;
     bool        game_use_rtp;
+    uint8_t     game_rtp_pt;
     uint16_t    game_rtp_seq;
     char        game_session_id[64];
     uint32_t    game_pad_id;
@@ -246,6 +250,11 @@ int stadia_transport_get_connected_count(void) {
         if (g_players[i].rpc_ready) cnt++;
     }
     return cnt;
+}
+
+bool stadia_transport_is_slot_game_ready(int slot) {
+    if (slot < 0 || slot >= STADIA_MAX_PLAYERS) return false;
+    return g_players[slot].game.handshake_done;
 }
 
 void stadia_transport_wake(void);
@@ -822,7 +831,11 @@ static void handle_proxy_request_raw(stadia_player_t *P, uint32_t outer_ticket,
     link_reset(&P->game);
     P->game.peer_seen = false;
     P->game_tx_seq = 0;
+    P->game_last_rx_seq = 0;
+    P->game_last_ts_us = 0;
     P->game_use_rtp = false;
+    P->game_rtp_pt = 0;
+    P->focus_game_sent = false;
 
     /* Encode RtcSdpAnswer + RtcIceCandidate for Game Session (:50002 + slot*4) */
     chrome_cloudcast_proto_api_common_RtcSdpAnswer *ans = calloc(1, sizeof(*ans));
@@ -913,9 +926,9 @@ static void send_game_rumble(stadia_player_t *P, uint16_t left, uint16_t right) 
     if (P->game_use_rtp) {
         uint8_t rtp[12 + 180];
         uint16_t seq = ++P->game_rtp_seq;
-        rtp[0] = 0x80; rtp[1] = 96;
+        rtp[0] = 0x80; rtp[1] = P->game_rtp_pt ? P->game_rtp_pt : 96;
         rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
-        memset(rtp + 4, 0, 8);
+        memset(rtp + 4, 0, 4);
         rtp[8] = 0x53; rtp[9] = 0x54; rtp[10] = 0x41; rtp[11] = 0x44;
         memcpy(rtp + 12, ipm, ipml);
         link_send_wire(&P->game, WIRE_ID_RTP, rtp, 12 + ipml);
@@ -1138,6 +1151,9 @@ typedef struct {
     uint32_t buttons;
     int32_t  lx, ly, rx, ry;
     uint32_t lt, rt;
+    bool     has_buttons;
+    bool     has_lx, has_ly, has_rx, has_ry;
+    bool     has_lt, has_rt;
     bool     is_reg;
 } fast_gamepad_v2_t;
 
@@ -1154,13 +1170,13 @@ static bool parse_gamepad_v2_fast(const uint8_t *buf, size_t len, fast_gamepad_v
             if (!pbw_read_varint(buf, len, &off, &v)) return false;
             switch (fn) {
             case 1:  out->id = (uint32_t)v; break;
-            case 2:  out->buttons = (uint32_t)v; break;
-            case 3:  out->lx = pbw_zigzag32((uint32_t)v); break;
-            case 4:  out->ly = pbw_zigzag32((uint32_t)v); break;
-            case 5:  out->rx = pbw_zigzag32((uint32_t)v); break;
-            case 6:  out->ry = pbw_zigzag32((uint32_t)v); break;
-            case 7:  out->lt = (uint32_t)v; break;
-            case 8:  out->rt = (uint32_t)v; break;
+            case 2:  out->buttons = (uint32_t)v; out->has_buttons = true; break;
+            case 3:  out->lx = pbw_zigzag32((uint32_t)v); out->has_lx = true; break;
+            case 4:  out->ly = pbw_zigzag32((uint32_t)v); out->has_ly = true; break;
+            case 5:  out->rx = pbw_zigzag32((uint32_t)v); out->has_rx = true; break;
+            case 6:  out->ry = pbw_zigzag32((uint32_t)v); out->has_ry = true; break;
+            case 7:  out->lt = (uint32_t)v; out->has_lt = true; break;
+            case 8:  out->rt = (uint32_t)v; out->has_rt = true; break;
             case 16: if (v != 0) out->is_reg = true; break;
             default: break;
             }
@@ -1189,9 +1205,11 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
     bool was_rtp = false;
 
     size_t rtp_len = 0;
+    uint8_t rx_pt = 96;
     const uint8_t *rtp_body = strip_rtp_header(payload, len, &rtp_len);
     if (rtp_body && rtp_len > 0) {
-        if ((payload[1] & 0x7Fu) == MIC_PAYLOAD_TYPE) return;
+        rx_pt = payload[1] & 0x7Fu;
+        if (rx_pt == MIC_PAYLOAD_TYPE) return;
         pb_data = rtp_body;
         pb_len = rtp_len;
         was_rtp = true;
@@ -1204,11 +1222,54 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         was_rtp = false;
     }
 
-    if (L->is_game) P->game_use_rtp = was_rtp;
+    if (L->is_game) {
+        P->game_use_rtp = was_rtp;
+        if (was_rtp && rx_pt != 0) P->game_rtp_pt = rx_pt;
+    }
 
     uint64_t seq_num = 0;
-    fast_gamepad_v2_t latest_g = {0};
-    bool have_g = false;
+    bool have_seq = false;
+    uint64_t base_ts_us = 0;
+    uint64_t max_ts_us = P->game_last_ts_us;
+
+    /* GamepadMessage_V2 is delta/sparse-encoded: omitted fields keep their previous value! */
+    uint32_t cur_buttons = P->last_set ? P->last_buttons : 0;
+    int32_t  cur_lx      = P->last_set ? P->last_lx : 0;
+    int32_t  cur_ly      = P->last_set ? P->last_ly : 0;
+    int32_t  cur_rx      = P->last_set ? P->last_rx : 0;
+    int32_t  cur_ry      = P->last_set ? P->last_ry : 0;
+    uint32_t cur_lt      = P->last_set ? P->last_lt : 0;
+    uint32_t cur_rt      = P->last_set ? P->last_rt : 0;
+    bool applied_any = false;
+
+    /* First pass: grab sequence_number (2) and base_timestamp_us (3) before iterating messages (4) */
+    {
+        size_t p1 = 0;
+        while (p1 < ser_len) {
+            uint64_t tag = 0;
+            if (!pbw_read_varint(ser, ser_len, &p1, &tag)) break;
+            uint32_t fn = (uint32_t)(tag >> 3);
+            uint32_t wt = (uint32_t)(tag & 7u);
+            if (wt == 0) {
+                uint64_t v = 0;
+                if (!pbw_read_varint(ser, ser_len, &p1, &v)) break;
+                if (fn == 2) { seq_num = v; have_seq = true; }
+                else if (fn == 3) { base_ts_us = v; }
+            } else if (wt == 1) {
+                if (p1 + 8 > ser_len) break;
+                p1 += 8;
+            } else if (wt == 2) {
+                uint64_t flen = 0;
+                if (!pbw_read_varint(ser, ser_len, &p1, &flen) || p1 + flen > ser_len) break;
+                p1 += (size_t)flen;
+            } else if (wt == 5) {
+                if (p1 + 4 > ser_len) break;
+                p1 += 4;
+            } else {
+                break;
+            }
+        }
+    }
 
     size_t off = 0;
     while (off < ser_len) {
@@ -1219,7 +1280,6 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         if (wt == 0) {
             uint64_t v = 0;
             if (!pbw_read_varint(ser, ser_len, &off, &v)) break;
-            if (fn == 2) seq_num = v;
         } else if (wt == 1) {
             if (off + 8 > ser_len) break;
             off += 8;
@@ -1233,15 +1293,55 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
                 memcpy(P->game_session_id, fptr, cpy);
                 P->game_session_id[cpy] = '\0';
             } else if (fn == 4) {
+                /* InputMessageSlim: field 4 = relative_time_us, field 5 = gamepad_message_v2 */
                 const uint8_t *gp = NULL;
                 size_t gp_len = 0;
-                if (pbw_find_bytes(fptr, (size_t)flen, 5, &gp, &gp_len)) {
+                uint32_t rel_us = 0;
+                size_t soff = 0;
+                while (soff < (size_t)flen) {
+                    uint64_t stag = 0;
+                    if (!pbw_read_varint(fptr, (size_t)flen, &soff, &stag)) break;
+                    uint32_t sfn = (uint32_t)(stag >> 3);
+                    uint32_t swt = (uint32_t)(stag & 7u);
+                    if (swt == 0) {
+                        uint64_t sv = 0;
+                        if (!pbw_read_varint(fptr, (size_t)flen, &soff, &sv)) break;
+                        if (sfn == 4) rel_us = (uint32_t)sv;
+                    } else if (swt == 1) {
+                        if (soff + 8 > (size_t)flen) break;
+                        soff += 8;
+                    } else if (swt == 2) {
+                        uint64_t sflen = 0;
+                        if (!pbw_read_varint(fptr, (size_t)flen, &soff, &sflen) || soff + sflen > (size_t)flen) break;
+                        if (sfn == 5) { gp = fptr + soff; gp_len = (size_t)sflen; }
+                        soff += (size_t)sflen;
+                    } else if (swt == 5) {
+                        if (soff + 4 > (size_t)flen) break;
+                        soff += 4;
+                    } else {
+                        break;
+                    }
+                }
+                if (gp && gp_len > 0) {
                     fast_gamepad_v2_t g;
                     if (parse_gamepad_v2_fast(gp, gp_len, &g)) {
                         if (g.id > 0) P->game_pad_id = g.id;
                         if (!g.is_reg) {
-                            latest_g = g;
-                            have_g = true;
+                            uint64_t t_us = base_ts_us + (uint64_t)rel_us;
+                            bool is_new = (base_ts_us > 0)
+                                          ? (t_us > P->game_last_ts_us)
+                                          : (!have_seq || seq_num > P->game_last_rx_seq);
+                            if (is_new) {
+                                if (g.has_buttons) cur_buttons = g.buttons;
+                                if (g.has_lx)      cur_lx      = g.lx;
+                                if (g.has_ly)      cur_ly      = g.ly;
+                                if (g.has_rx)      cur_rx      = g.rx;
+                                if (g.has_ry)      cur_ry      = g.ry;
+                                if (g.has_lt)      cur_lt      = g.lt;
+                                if (g.has_rt)      cur_rt      = g.rt;
+                                if (t_us > max_ts_us) max_ts_us = t_us;
+                                applied_any = true;
+                            }
                         }
                     }
                 }
@@ -1254,23 +1354,34 @@ static void handle_0x66_input(dtls_link_t *L, const uint8_t *payload, size_t len
         }
     }
 
-    if (have_g) {
-        dispatch_input(P, latest_g.buttons, latest_g.lx, latest_g.ly,
-                       latest_g.rx, latest_g.ry, latest_g.lt, latest_g.rt);
+    if (have_seq && seq_num > P->game_last_rx_seq) {
+        P->game_last_rx_seq = seq_num;
+    }
+    if (max_ts_us > P->game_last_ts_us) {
+        P->game_last_ts_us = max_ts_us;
     }
 
-    uint8_t ack[16];
-    size_t al = pbw_put_u64(ack, sizeof(ack), 4, seq_num);
-    if (was_rtp) {
-        uint8_t rtp[12 + 16];
-        uint16_t seq = ++P->game_rtp_seq;
-        rtp[0] = 0x80; rtp[1] = 96;
-        rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
-        memset(rtp + 4, 0, 8);
-        memcpy(rtp + 12, ack, al);
-        link_send_wire(L, WIRE_ID_RTP, rtp, 12 + al);
-    } else {
-        link_send_wire(L, WIRE_ID_RTP, ack, al);
+    if (applied_any) {
+        dispatch_input(P, cur_buttons, cur_lx, cur_ly, cur_rx, cur_ry, cur_lt, cur_rt);
+    }
+
+    if (have_seq) {
+        uint8_t ack[16];
+        size_t al = pbw_put_u64(ack, sizeof(ack), 4, seq_num);
+        if (was_rtp) {
+            uint8_t rtp[12 + 16];
+            uint16_t seq = ++P->game_rtp_seq;
+            uint32_t ts = (uint32_t)((esp_timer_get_time() / 1000LL) * 90LL);
+            rtp[0] = 0x80; rtp[1] = P->game_rtp_pt ? P->game_rtp_pt : 96;
+            rtp[2] = (uint8_t)(seq >> 8); rtp[3] = (uint8_t)(seq & 0xFF);
+            rtp[4] = (uint8_t)(ts >> 24); rtp[5] = (uint8_t)(ts >> 16);
+            rtp[6] = (uint8_t)(ts >> 8);  rtp[7] = (uint8_t)(ts & 0xFF);
+            rtp[8] = 0x53; rtp[9] = 0x54; rtp[10] = 0x41; rtp[11] = 0x44;
+            memcpy(rtp + 12, ack, al);
+            link_send_wire(L, WIRE_ID_RTP, rtp, 12 + al);
+        } else {
+            link_send_wire(L, WIRE_ID_RTP, ack, al);
+        }
     }
 }
 
@@ -1298,8 +1409,12 @@ static void pump_dtls(dtls_link_t *L) {
             if (!L->is_game) {
                 P->rpc_ready = false;
                 P->start_game_sent = false;
+                P->focus_game_sent = false;
                 P->last_state_req_us = 0;
             } else {
+                P->focus_game_sent = false;
+                P->game_last_rx_seq = 0;
+                P->game_last_ts_us = 0;
                 P->rumble_dirty = true;
             }
             ESP_LOGI(TAG, "[P%d:%s] DTLS handshake complete!", L->slot + 1, L->name);
@@ -1320,6 +1435,7 @@ static void pump_dtls(dtls_link_t *L) {
         if (!L->is_game) {
             P->rpc_ready = false;
             P->start_game_sent = false;
+            P->focus_game_sent = false;
             P->last_set = false;
             P->battery_pct = -1;
             P->batt_warn_15 = false;
@@ -1523,6 +1639,7 @@ static void stadia_transport_task(void *arg) {
                 link_reset(&P->game);
                 P->rpc_ready = false;
                 P->start_game_sent = false;
+                P->focus_game_sent = false;
                 P->last_set = false;
                 P->battery_pct = -1;
                 P->batt_warn_15 = false;
@@ -1575,6 +1692,14 @@ static void stadia_transport_task(void *arg) {
                     P->last_state_req_us = now;
                     send_get_controller_state_request(P);
                 }
+            }
+            if (P->game.handshake_done && !P->focus_game_sent && P->disp.handshake_done &&
+                (now - P->game.dtls_done_us) >= 150000) {
+                P->focus_game_sent = true;
+                /* DisplayToController { focus_game(4) = Empty{} } -> switches controller from 20 Hz menu to 125 Hz game input */
+                static const uint8_t fg[2] = { 0x22, 0x00 };
+                link_send_rpc_request(&P->disp, WIRE_ID_RPC_DISPLAY, ++P->rpc_ticket, fg, sizeof(fg));
+                ESP_LOGI(TAG, "[P%d] Auto-sent focus_game (125 Hz Game Session input enabled)", slot + 1);
             }
 
             haptic_tick(P, now);

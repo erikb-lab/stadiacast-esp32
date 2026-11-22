@@ -306,6 +306,7 @@ static esp_err_t get_api_status(httpd_req_t *req) {
     cJSON_AddNumberToObject(root, "usb_mode", (int)usb_gamepad_get_mode());
     cJSON_AddNumberToObject(root, "max_players", (int)max_p);
     cJSON_AddNumberToObject(root, "connected_count", stadia_transport_get_connected_count());
+    cJSON_AddBoolToObject(root, "game_hs", stadia_transport_is_slot_game_ready(0));
 
     cJSON *parr = cJSON_CreateArray();
     if (parr) {
@@ -471,10 +472,18 @@ static esp_err_t post_api_ota(httpd_req_t *req) {
     int received = 0;
     const char *err_msg = NULL;
 
+    int timeouts = 0;
     while (remaining > 0) {
         int to_read = remaining > 4096 ? 4096 : remaining;
         int r = httpd_req_recv(req, (char *)buf, to_read);
-        if (r == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (r == HTTPD_SOCK_ERR_TIMEOUT) {
+            if (++timeouts >= 3) {
+                err_msg = "Upload timed out";
+                break;
+            }
+            continue;
+        }
+        timeouts = 0;
         if (r <= 0) {
             err_msg = "Upload interrupted";
             break;

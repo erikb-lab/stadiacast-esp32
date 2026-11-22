@@ -21,6 +21,7 @@ void stadia_transport_set_rumble_slot(int slot, uint16_t left_strong, uint16_t r
 
 bool stadia_transport_is_ready(void);
 bool stadia_transport_is_slot_ready(int slot);
+bool stadia_transport_is_slot_game_ready(int slot);
 int  stadia_transport_get_battery_pct(void);
 int  stadia_transport_get_slot_battery_pct(int slot);
 uint32_t stadia_transport_get_slot_peer_ip(int slot);
