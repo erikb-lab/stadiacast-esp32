@@ -196,6 +196,8 @@ STADIA_EXT_BSS static uint8_t g_rpc_tx[TX_BUF_MAX];
 
 /* Phase 6A: SRTP bidirectional audio state (Player 1 when max_players == 1) */
 static bool     g_audio_enabled;
+static bool     g_ctrl_mic_on;
+static int64_t  g_mic_idle_since_us;
 static int64_t  g_audio_next_tx_us;
 static uint16_t g_audio_seq;
 static uint32_t g_audio_ts;
@@ -1076,8 +1078,9 @@ static void handle_disp_rpc_response(stadia_player_t *P, const gotham_rpc_RpcRes
         if (!P->start_game_sent) send_start_game_request(P);
         if (P->slot == 0 && usb_gamepad_get_max_players() == 1 && !g_audio_enabled) {
             send_set_audio_mode(P, 2, true);
-            send_set_microphone(P, true);
             g_audio_enabled = true;
+            g_ctrl_mic_on = false;
+            g_mic_idle_since_us = 0;
             g_audio_next_tx_us = 0;
         }
     }
@@ -1441,7 +1444,12 @@ static void pump_dtls(dtls_link_t *L) {
             P->batt_warn_15 = false;
             P->batt_warn_5 = false;
             P->headset_plugged = false;
-            if (P->slot == 0) usb_gamepad_set_headset(false);
+            if (P->slot == 0) {
+                usb_gamepad_set_headset(false);
+                g_audio_enabled = false;
+                g_ctrl_mic_on = false;
+                g_mic_idle_since_us = 0;
+            }
             usb_gamepad_set_battery_slot(P->slot, -1);
             usb_gamepad_reset_slot(P->slot);
             link_reset(&P->game);
@@ -1645,7 +1653,12 @@ static void stadia_transport_task(void *arg) {
                 P->batt_warn_15 = false;
                 P->batt_warn_5 = false;
                 P->headset_plugged = false;
-                if (slot == 0) usb_gamepad_set_headset(false);
+                if (slot == 0) {
+                    usb_gamepad_set_headset(false);
+                    g_audio_enabled = false;
+                    g_ctrl_mic_on = false;
+                    g_mic_idle_since_us = 0;
+                }
                 usb_gamepad_set_battery_slot(slot, -1);
                 usb_gamepad_reset_slot(slot);
                 snprintf(P->disp.ctrl_ufrag, sizeof(P->disp.ctrl_ufrag), "%s", P->pending_ufrag);
@@ -1881,6 +1894,29 @@ static void stadia_transport_task(void *arg) {
             if (P->rpc_ready) any_ready = true;
             if (P->battery_pct >= 0 && P->battery_pct <= 15) any_low_batt = true;
             if (P->combo_active != 0) any_combo_held = true;
+        }
+
+        /* Smart on-demand controller microphone: keeps controller LED solid white when idle,
+         * and pulses white only while the host OS is actively capturing audio (and not muted). */
+        if (g_audio_enabled && usb_gamepad_get_max_players() == 1 &&
+            g_players[0].rpc_ready && g_players[0].disp.handshake_done) {
+            bool want_mic = !usb_audio_is_mic_muted() &&
+                            (usb_audio_mic_active() || stadia_opus_is_loopback());
+            if (want_mic) {
+                g_mic_idle_since_us = 0;
+                if (!g_ctrl_mic_on) {
+                    g_ctrl_mic_on = true;
+                    send_set_microphone(&g_players[0], true);
+                }
+            } else if (g_ctrl_mic_on) {
+                if (g_mic_idle_since_us == 0) {
+                    g_mic_idle_since_us = now;
+                } else if ((now - g_mic_idle_since_us) >= 600000) {
+                    g_ctrl_mic_on = false;
+                    g_mic_idle_since_us = 0;
+                    send_set_microphone(&g_players[0], false);
+                }
+            }
         }
 
         status_led_update(now, any_ready, usb_audio_is_mic_muted(), any_low_batt, any_combo_held);

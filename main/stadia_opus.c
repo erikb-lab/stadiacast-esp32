@@ -300,9 +300,13 @@ static void opus_worker_task(void *arg) {
                         }
                     } else {
                         uint16_t g = (uint16_t)atomic_load_explicit(&s_mic_gain_q8, memory_order_relaxed);
-                        if (g != 256u) {
+                        uint16_t os_g = usb_audio_get_mic_scale_q8();
+                        uint32_t total_q8 = ((uint32_t)g * (uint32_t)os_g) >> 8;
+                        if (total_q8 == 0u) {
+                            memset(s_dec_mono, 0, (size_t)ns * sizeof(int16_t));
+                        } else if (total_q8 != 256u) {
                             for (int i = 0; i < ns; i++) {
-                                int32_t v = ((int32_t)s_dec_mono[i] * (int32_t)g) >> 8;
+                                int32_t v = ((int32_t)s_dec_mono[i] * (int32_t)total_q8) >> 8;
                                 if (v > 32767) v = 32767;
                                 else if (v < -32768) v = -32768;
                                 s_dec_mono[i] = (int16_t)v;
@@ -333,6 +337,16 @@ static void opus_worker_task(void *arg) {
             }
 
             while (read_speaker_frame(s_enc_stereo)) {
+                bool spk_muted = usb_audio_is_spk_muted();
+                uint16_t spk_scale = usb_audio_get_spk_scale_q15();
+                if (spk_muted || spk_scale == 0u) {
+                    memset(s_enc_stereo, 0, sizeof(s_enc_stereo));
+                } else if (spk_scale < 32768u) {
+                    const size_t n = STADIA_FRAME_SAMPLES * STADIA_SPK_CHANNELS;
+                    for (size_t i = 0; i < n; i++) {
+                        s_enc_stereo[i] = (int16_t)(((int32_t)s_enc_stereo[i] * (int32_t)spk_scale) >> 15);
+                    }
+                }
                 int elen = opus_encode(enc, s_enc_stereo, STADIA_FRAME_SAMPLES,
                                        s_enc_pkt, sizeof(s_enc_pkt));
                 if (elen > 0) {

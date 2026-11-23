@@ -1,13 +1,25 @@
 #include "usb_audio.h"
 #include "stadia_opus.h"
 
+#include <math.h>
 #include <stdatomic.h>
 #include <string.h>
 #include "esp_attr.h"
 #include "esp_log.h"
 #include "class/audio/audio_device.h"
 
+extern void stadia_transport_wake(void);
+
 #define TAG "USB_AUDIO"
+
+/* UAC1 Feature Unit volume ranges in signed Q8.8 dB (1/256 dB units) */
+#define UAC1_SPK_VOL_MIN_Q8  ((int16_t)(-60 * 256))  /* -60 dB */
+#define UAC1_SPK_VOL_MAX_Q8  ((int16_t)(  0 * 256))  /*   0 dB */
+#define UAC1_SPK_VOL_RES_Q8  ((int16_t)(  1 * 256))  /*   1 dB */
+
+#define UAC1_MIC_VOL_MIN_Q8  ((int16_t)(-24 * 256))  /* -24 dB */
+#define UAC1_MIC_VOL_MAX_Q8  ((int16_t)( 12 * 256))  /* +12 dB */
+#define UAC1_MIC_VOL_RES_Q8  ((int16_t)(  1 * 256))  /*   1 dB */
 
 /* Power-of-2 lock-free SPSC byte buffer for USB Speaker OUT (48kHz stereo s16le = 192B/ms) */
 #if CONFIG_SPIRAM
@@ -43,6 +55,11 @@ static uint8_t              s_mic_itf = USB_ITF_AUDIO_STREAMING_MIC;
 static atomic_bool          s_spk_flush = ATOMIC_VAR_INIT(false);
 static atomic_bool          s_mic_primed = ATOMIC_VAR_INIT(false);
 static atomic_bool          s_mic_muted = ATOMIC_VAR_INIT(false);
+static atomic_bool          s_spk_muted = ATOMIC_VAR_INIT(false);
+static atomic_int_fast16_t  s_spk_vol_q8 = ATOMIC_VAR_INIT(0);        /* 0 dB */
+static atomic_int_fast16_t  s_mic_vol_q8 = ATOMIC_VAR_INIT(0);        /* 0 dB */
+static atomic_uint_fast16_t s_spk_scale_q15 = ATOMIC_VAR_INIT(32768u);/* 1.0x */
+static atomic_uint_fast16_t s_mic_scale_q8  = ATOMIC_VAR_INIT(256u);  /* 1.0x */
 
 static atomic_uint_fast32_t s_rx_cb_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast32_t s_rx_bytes_total = ATOMIC_VAR_INIT(0);
@@ -180,12 +197,35 @@ bool usb_audio_mic_active(void) {
     return atomic_load_explicit(&s_mic_alt, memory_order_acquire) != 0;
 }
 
+static uint16_t db_q8_to_scale(int16_t vol_q8, int16_t min_q8, uint16_t unity) {
+    if (vol_q8 <= min_q8) return 0u;
+    float db = (float)vol_q8 / 256.0f;
+    float lin = powf(10.0f, db / 20.0f);
+    int32_t scaled = (int32_t)lroundf(lin * (float)unity);
+    if (scaled < 0) scaled = 0;
+    if (scaled > 65535) scaled = 65535;
+    return (uint16_t)scaled;
+}
+
 void usb_audio_set_mic_muted(bool muted) {
     atomic_store_explicit(&s_mic_muted, muted, memory_order_release);
+    stadia_transport_wake();
 }
 
 bool usb_audio_is_mic_muted(void) {
     return atomic_load_explicit(&s_mic_muted, memory_order_acquire);
+}
+
+bool usb_audio_is_spk_muted(void) {
+    return atomic_load_explicit(&s_spk_muted, memory_order_acquire);
+}
+
+uint16_t usb_audio_get_spk_scale_q15(void) {
+    return (uint16_t)atomic_load_explicit(&s_spk_scale_q15, memory_order_acquire);
+}
+
+uint16_t usb_audio_get_mic_scale_q8(void) {
+    return (uint16_t)atomic_load_explicit(&s_mic_scale_q8, memory_order_acquire);
 }
 
 size_t usb_audio_read_spk_pcm(int16_t *stereo_out, size_t max_frames) {
@@ -222,6 +262,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
         if (alt != 0) {
             push_mic_tx_1ms();
         }
+        stadia_transport_wake();
         return true;
     }
 
@@ -240,8 +281,107 @@ bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const 
     } else if (itf == s_mic_itf) {
         atomic_store_explicit(&s_mic_alt, 0, memory_order_release);
         atomic_store_explicit(&s_mic_primed, false, memory_order_release);
+        stadia_transport_wake();
     }
     return true;
+}
+
+bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request) {
+    if (!p_request) return false;
+    uint8_t entity = tu_u16_high(p_request->wIndex);
+    uint8_t ctrl   = tu_u16_high(p_request->wValue);
+
+    static uint8_t s_u8_reply;
+    static int16_t s_i16_reply;
+
+    if (entity == USB_UAC1_SPK_FU_ID) {
+        if (ctrl == AUDIO10_FU_CTRL_MUTE && p_request->bRequest == AUDIO10_CS_REQ_GET_CUR) {
+            s_u8_reply = atomic_load_explicit(&s_spk_muted, memory_order_acquire) ? 1u : 0u;
+            return tud_control_xfer(rhport, p_request, &s_u8_reply, sizeof(s_u8_reply));
+        }
+        if (ctrl == AUDIO10_FU_CTRL_VOLUME) {
+            switch (p_request->bRequest) {
+            case AUDIO10_CS_REQ_GET_CUR:
+                s_i16_reply = (int16_t)atomic_load_explicit(&s_spk_vol_q8, memory_order_acquire);
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_MIN:
+                s_i16_reply = UAC1_SPK_VOL_MIN_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_MAX:
+                s_i16_reply = UAC1_SPK_VOL_MAX_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_RES:
+                s_i16_reply = UAC1_SPK_VOL_RES_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            default:
+                break;
+            }
+        }
+    } else if (entity == USB_UAC1_MIC_FU_ID) {
+        if (ctrl == AUDIO10_FU_CTRL_MUTE && p_request->bRequest == AUDIO10_CS_REQ_GET_CUR) {
+            s_u8_reply = atomic_load_explicit(&s_mic_muted, memory_order_acquire) ? 1u : 0u;
+            return tud_control_xfer(rhport, p_request, &s_u8_reply, sizeof(s_u8_reply));
+        }
+        if (ctrl == AUDIO10_FU_CTRL_VOLUME) {
+            switch (p_request->bRequest) {
+            case AUDIO10_CS_REQ_GET_CUR:
+                s_i16_reply = (int16_t)atomic_load_explicit(&s_mic_vol_q8, memory_order_acquire);
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_MIN:
+                s_i16_reply = UAC1_MIC_VOL_MIN_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_MAX:
+                s_i16_reply = UAC1_MIC_VOL_MAX_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            case AUDIO10_CS_REQ_GET_RES:
+                s_i16_reply = UAC1_MIC_VOL_RES_Q8;
+                return tud_control_xfer(rhport, p_request, &s_i16_reply, sizeof(s_i16_reply));
+            default:
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+bool tud_audio_set_req_entity_cb(uint8_t rhport, tusb_control_request_t const *p_request, uint8_t *pBuff) {
+    (void)rhport;
+    if (!p_request || !pBuff) return false;
+    uint8_t entity = tu_u16_high(p_request->wIndex);
+    uint8_t ctrl   = tu_u16_high(p_request->wValue);
+
+    if (p_request->bRequest != AUDIO10_CS_REQ_SET_CUR) return false;
+
+    if (entity == USB_UAC1_SPK_FU_ID) {
+        if (ctrl == AUDIO10_FU_CTRL_MUTE && p_request->wLength >= 1) {
+            atomic_store_explicit(&s_spk_muted, pBuff[0] != 0, memory_order_release);
+            return true;
+        }
+        if (ctrl == AUDIO10_FU_CTRL_VOLUME && p_request->wLength >= 2) {
+            int16_t v = (int16_t)((uint16_t)pBuff[0] | ((uint16_t)pBuff[1] << 8));
+            if (v < UAC1_SPK_VOL_MIN_Q8) v = UAC1_SPK_VOL_MIN_Q8;
+            if (v > UAC1_SPK_VOL_MAX_Q8) v = UAC1_SPK_VOL_MAX_Q8;
+            atomic_store_explicit(&s_spk_vol_q8, v, memory_order_release);
+            uint16_t sc = db_q8_to_scale(v, UAC1_SPK_VOL_MIN_Q8, 32768u);
+            atomic_store_explicit(&s_spk_scale_q15, sc, memory_order_release);
+            return true;
+        }
+    } else if (entity == USB_UAC1_MIC_FU_ID) {
+        if (ctrl == AUDIO10_FU_CTRL_MUTE && p_request->wLength >= 1) {
+            usb_audio_set_mic_muted(pBuff[0] != 0);
+            return true;
+        }
+        if (ctrl == AUDIO10_FU_CTRL_VOLUME && p_request->wLength >= 2) {
+            int16_t v = (int16_t)((uint16_t)pBuff[0] | ((uint16_t)pBuff[1] << 8));
+            if (v < UAC1_MIC_VOL_MIN_Q8) v = UAC1_MIC_VOL_MIN_Q8;
+            if (v > UAC1_MIC_VOL_MAX_Q8) v = UAC1_MIC_VOL_MAX_Q8;
+            atomic_store_explicit(&s_mic_vol_q8, v, memory_order_release);
+            uint16_t sc = db_q8_to_scale(v, UAC1_MIC_VOL_MIN_Q8, 256u);
+            atomic_store_explicit(&s_mic_scale_q8, sc, memory_order_release);
+            return true;
+        }
+    }
+    return false;
 }
 
 bool tud_audio_set_req_ep_cb(uint8_t rhport, tusb_control_request_t const *p_request, uint8_t *pBuff) {
