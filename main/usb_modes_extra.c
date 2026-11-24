@@ -449,11 +449,12 @@ static void sw_read_spi_flash(uint32_t addr, uint8_t len, uint8_t *dst) {
             0x2D, 0x2D, 0x2D, 0xE6, 0xE6, 0xE6, 0x2D, 0x2D, 0x2D, 0x2D, 0x2D, 0x2D,
         };
         memcpy(s_spi_6000 + 0x50, k_colors, sizeof(k_colors));
-        /* 0x6080..0x6085: IMU horizontal offsets */
-        memset(s_spi_6000 + 0x80, 0x00, 6);
-        /* 0x6086..0x60A9: Factory L & R stick parameters (standard Pro Controller values) */
+        /* 0x6080..0x6085: IMU horizontal offsets (values read from a real Pro Controller over USB) */
+        static const uint8_t k_imu_hoff[6] = { 0x50, 0xFD, 0x00, 0x00, 0xC6, 0x0F };
+        memcpy(s_spi_6000 + 0x80, k_imu_hoff, sizeof(k_imu_hoff));
+        /* 0x6086..0x60A9: Factory L & R stick parameters (values read from a real Pro Controller over USB) */
         static const uint8_t k_sparams[18] = {
-            0x0F, 0x30, 0x61, 0x00, 0x00, 0xF3, 0xD4, 0x14, 0x54,
+            0x0F, 0x30, 0x61, 0x96, 0x30, 0xF3, 0xD4, 0x14, 0x54,
             0x41, 0x15, 0x54, 0xC7, 0x79, 0x9C, 0x33, 0x36, 0x63,
         };
         memcpy(s_spi_6000 + 0x86, k_sparams, 18);
@@ -469,6 +470,19 @@ static void sw_read_spi_flash(uint32_t addr, uint8_t len, uint8_t *dst) {
             dst[i] = 0xFF;
         }
     }
+}
+
+/* CRC-8 (poly 0x07, init 0) over bytes 15..47 of an NFC/IR MCU reply, stored at byte 48.
+ * Matches the 0x21 reply of a real Pro Controller over USB (CRC 0x5C). */
+static uint8_t sw_mcu_crc8(const uint8_t *data, size_t len) {
+    uint8_t crc = 0;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x80u) ? (uint8_t)((crc << 1) ^ 0x07u) : (uint8_t)(crc << 1);
+        }
+    }
+    return crc;
 }
 
 static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
@@ -528,14 +542,20 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
         rep[14] = subcmd;
 
         switch (subcmd) {
+        case 0x01: /* Bluetooth manual pairing. Over USB the Switch sends step 0x04 (host address + name)
+                    * and a real Pro Controller answers ACK 0x81 with data 0x03. A plain 0x80 ACK
+                    * here made the Switch's hid sysmodule abort (fatal 2162-0002) on FW 20.5.0. */
+            rep[13] = 0x81;
+            rep[15] = 0x03;
+            break;
         case 0x02: /* Request Device Info */
             rep[13] = 0x82;
             rep[15] = 0x03; rep[16] = 0x8B; /* FW 3.139 */
             rep[17] = 0x03;                 /* Pro Controller */
             rep[18] = 0x02;
             memcpy(rep + 19, s_mac, 6);
-            rep[25] = 0x01;
-            rep[26] = 0x02;                 /* Use SPI colors */
+            rep[25] = 0x03;                 /* Same trailing bytes as a real Pro Controller over USB */
+            rep[26] = 0x01;                 /* Use SPI colors */
             break;
         case 0x03: /* Set Input Report Mode */
             rep[13] = 0x80;
@@ -558,8 +578,15 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
                 sw_read_spi_flash(addr, rlen, rep + 20);
             }
             break;
+        case 0x21: { /* Set NFC/IR MCU configuration: MCU state report, as sent by a real Pro Controller */
+            static const uint8_t k_mcu_state[8] = { 0x01, 0x00, 0xFF, 0x00, 0x03, 0x00, 0x05, 0x01 };
+            rep[13] = 0xA0;
+            memcpy(rep + 15, k_mcu_state, sizeof(k_mcu_state));
+            rep[48] = sw_mcu_crc8(rep + 15, 33);
+            break;
+        }
         default:
-            /* 0x01, 0x08, 0x21, 0x22, 0x30 (Player LEDs), 0x38 (Home LED), 0x40 (IMU), 0x48 (Vib) */
+            /* 0x08, 0x22, 0x30 (Player LEDs), 0x38 (Home LED), 0x40 (IMU), 0x48 (Vib) */
             rep[13] = 0x80;
             break;
         }
