@@ -2,6 +2,7 @@
  * Supports 1..4 Concurrent Stadia Controllers. */
 #include "stadia_transport.h"
 #include "stadia_signaling.h"
+#include "status_led.h"
 #include "ota_updater.h"
 #include "usb_gamepad.h"
 #include "usb_audio.h"
@@ -1520,43 +1521,6 @@ static void service_timers(dtls_link_t *L) {
             L->last_stun_tx_us = now;
             stun_send_check(L);
         }
-    }
-}
-
-/* On-board XIAO ESP32-S3 orange user LED (GPIO 21, active-LOW) */
-#define STATUS_LED_GPIO GPIO_NUM_21
-
-static void status_led_init(void) {
-    gpio_config_t io = {
-        .pin_bit_mask = 1ULL << STATUS_LED_GPIO,
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io);
-    gpio_set_level(STATUS_LED_GPIO, 1); /* OFF (active-low) */
-}
-
-static void status_led_update(int64_t now_us, bool ready, bool mic_muted, bool low_batt, bool combo_held) {
-    static int s_last_level = -1;
-    bool on;
-    if (combo_held) {
-        on = ((now_us / 100000) & 1) == 0;
-    } else if (!ready) {
-        on = (now_us % 1000000) < 100000;
-    } else if (mic_muted) {
-        on = ((now_us / 500000) & 1) == 0;
-    } else if (low_batt) {
-        int64_t t = now_us % 2000000;
-        on = !((t < 120000) || (t >= 240000 && t < 360000));
-    } else {
-        on = true;
-    }
-    int level = on ? 0 : 1;
-    if (level != s_last_level) {
-        gpio_set_level(STATUS_LED_GPIO, level);
-        s_last_level = level;
     }
 }
 

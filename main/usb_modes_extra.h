@@ -48,5 +48,6 @@ bool usb_modes_extra_flush_tx(usb_gamepad_mode_t mode,
 
 bool usb_modes_extra_has_pending_tx(usb_gamepad_mode_t mode);
 int64_t usb_modes_extra_keepalive_us(usb_gamepad_mode_t mode);
+size_t usb_modes_extra_format_usb_log(char *dst, size_t max_len);
 
 #endif /* USB_MODES_EXTRA_H */

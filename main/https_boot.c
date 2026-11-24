@@ -508,7 +508,7 @@ static httpd_handle_t http80 = NULL;
 static void https_boot_init_http80(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
-    config.max_uri_handlers = 12;
+    config.max_uri_handlers = 16;
     config.recv_wait_timeout = 30;
     config.send_wait_timeout = 30;
     config.lru_purge_enable = true;

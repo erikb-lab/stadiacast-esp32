@@ -37,7 +37,7 @@ exposes your Stadia Controller over USB-C as a **Stadia Wireless Adapter**
 - **Live Controller Battery Reporting**:
   - **Native OS Battery Gauge (Stadia HID mode):** Standard USB HID Battery Strength (Report ID 4, `0–100%`) — shows up automatically in Linux UPower / KDE Plasma / GNOME (`gaming-input`) with zero extra drivers or daemons. Reads initial charge immediately on connect (`GetControllerStateResponse.f10`), tracks live 1% steps (`notification10`), and caches the last known level in NVS across reboots.
   - **Low-Battery Alerts & On-Demand Check (Both Modes):** Haptic alerts at `≤ 15%` (3 buzzes) and `≤ 5%` (5 buzzes) with hysteresis, status LED double-dip warning, plus an instant quartile buzz hotkey.
-- **Radial Stick Deadzone (`0% / 4% / 8%`, saved in NVS)** & **On-Board Status LED (`GPIO 21`)**
+- **Radial Stick Deadzone (`0% / 4% / 8%`, saved in NVS)** & **Configurable On-Board Status LED (`v1.8.8`, Plain GPIO or WS2812 RGB for SuperMini/S3-Zero/DevKitC-1)**
 
 ## Controller Hotkeys
 
@@ -74,7 +74,7 @@ GitHub Actions automatically builds **3 firmware variants** on every commit and 
 | **[Seeed Studio XIAO ESP32-S3](https://www.amazon.com/s?k=Seeed+Studio+XIAO+ESP32-S3)** | `S3R8` · 8 MB Flash · **8 MB OPI PSRAM** | USB-C | `stadiacast-esp32` *(Default 8MB OPI)* | <!-- board:xiao-s3 --> ✅ Tested & Working |
 | **[Waveshare ESP32-S3-Nano](https://www.amazon.com/s?k=Waveshare+ESP32-S3-Nano)** | `S3R8` · 16 MB Flash · **8 MB OPI PSRAM** | USB-C | `stadiacast-esp32` *(Default 8MB OPI)* | <!-- board:waveshare-s3-nano --> ✅ Community Verified |
 | **[Waveshare ESP32-S3-Zero](https://www.amazon.com/s?k=Waveshare+ESP32-S3-Zero)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:waveshare-s3-zero --> 🧪 Untested |
-| **[ESP32-S3 SuperMini / ProMini](https://www.amazon.com/s?k=ESP32-S3+SuperMini+Development+Board)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:s3-supermini --> 🧪 Untested |
+| **[ESP32-S3 SuperMini / ProMini](https://www.amazon.com/s?k=ESP32-S3+SuperMini+Development+Board)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:s3-supermini --> ✅ Community Verified |
 | **[Wemos / Lolin S3 Mini](https://www.amazon.com/s?k=Lolin+S3+Mini+ESP32-S3)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:lolin-s3-mini --> 🧪 Untested |
 | **[Waveshare ESP32-S3-GEEK (USB-A Stick)](https://www.amazon.com/s?k=Waveshare+ESP32-S3-GEEK)** | `S3RH2` · 16 MB Flash · **2 MB Quad PSRAM** | Built-in USB-A | `stadiacast-esp32-s3-quad` | <!-- board:waveshare-s3-geek --> 🧪 Untested |
 | **[Adafruit QT Py ESP32-S3 (2MB PSRAM)](https://www.amazon.com/s?k=Adafruit+QT+Py+ESP32-S3)** | `FH4R2` · 4 MB Flash · **2 MB Quad PSRAM** | USB-C | `stadiacast-esp32-s3-quad` | <!-- board:qtpy-s3-psram --> 🧪 Untested |
@@ -111,7 +111,7 @@ Open the **[Stadia Wireless Adapter Web Flasher](https://erikb-lab.github.io/sta
 
 ### Manual Download (`esptool` CLI)
 
-Download `stadiacast-esp32-v1.8.7-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
+Download `stadiacast-esp32-v1.8.8-merged.bin` (initial USB flash) or `stadiacast-esp32.bin` (Wi-Fi OTA via `http://192.168.4.1`) from the
 [GitHub Releases](https://github.com/erikb-lab/stadiacast-esp32/releases) page.
 
 ### Step 1: Enter Bootloader Mode
@@ -128,7 +128,7 @@ No software install required (requires Chrome, Edge, or Brave):
 
 1. Open [Adafruit WebSerial ESPTool](https://adafruit.github.io/Adafruit_WebSerial_ESPTool/) or [ESP Web Tool](https://esp.huhn.me/).
 2. Click **Connect** and select the **USB JTAG/serial debug unit** (`COMx` / `usbmodem` / `ttyACM0`).
-3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.8.7-merged.bin`, and click **Program**.
+3. Set offset to **`0x0`**, select `stadiacast-esp32-v1.8.8-merged.bin`, and click **Program**.
 4. When complete, tap **`R` (RESET)** or unplug and replug the XIAO ESP32-S3.
 
 ### Option B: Flash with `esptool` (CLI)
@@ -148,7 +148,7 @@ pip install esptool
 python -m esptool --chip esp32s3 --port COM5 --baud 460800 `
   --before default_reset --after hard_reset write_flash `
   --flash_mode dio --flash_freq 80m --flash_size 8MB `
-  0x0 stadiacast-esp32-v1.8.7-merged.bin
+  0x0 stadiacast-esp32-v1.8.8-merged.bin
 ```
 
 *(If `COMx` does not appear, verify you are using a USB-C data cable, not a charge-only cable. Windows 10/11 includes the built-in `usbser.sys` driver for ESP32-S3 USB Serial/JTAG.)*
@@ -167,7 +167,7 @@ ls /dev/cu.usbmodem*
 python3 -m esptool --chip esp32s3 --port /dev/cu.usbmodem1101 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.8.7-merged.bin
+  0x0 stadiacast-esp32-v1.8.8-merged.bin
 ```
 
 #### Linux (Terminal)
@@ -184,7 +184,7 @@ ls /dev/ttyACM*
 python3 -m esptool --chip esp32s3 --port /dev/ttyACM0 --baud 460800 \
   --before default_reset --after hard_reset write_flash \
   --flash_mode dio --flash_freq 80m --flash_size 8MB \
-  0x0 stadiacast-esp32-v1.8.7-merged.bin
+  0x0 stadiacast-esp32-v1.8.8-merged.bin
 ```
 
 3. Unplug and replug the XIAO ESP32-S3. Verify enumeration with:

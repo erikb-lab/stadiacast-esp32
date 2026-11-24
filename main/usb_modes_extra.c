@@ -6,6 +6,7 @@
 #include "usb_modes_extra.h"
 #include "usb_audio.h"
 
+#include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -15,6 +16,65 @@
 
 #define TAG "USB-EXTRA"
 #define TRIGGER_THRESHOLD 30
+
+/* Compact 32-entry USB HID handshake/command trace ring (readable via GET /api/usb-log) */
+#define USB_LOG_CAP 32u
+typedef struct {
+    uint32_t ms;
+    char     dir; /* 'R' = host->dev, 'T' = dev->host */
+    uint8_t  rid;
+    uint16_t len;
+    uint8_t  head[16];
+} usb_log_entry_t;
+
+static usb_log_entry_t s_usb_log[USB_LOG_CAP];
+static uint32_t        s_usb_log_wr = 0;
+static portMUX_TYPE    s_usb_log_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void usb_log_push(char dir, uint8_t rid, const uint8_t *data, uint16_t len) {
+    usb_log_entry_t e = {0};
+    e.ms  = (uint32_t)(esp_timer_get_time() / 1000LL);
+    e.dir = dir;
+    e.rid = rid;
+    e.len = len;
+    uint16_t n = (len > sizeof(e.head)) ? (uint16_t)sizeof(e.head) : len;
+    if (data && n > 0) memcpy(e.head, data, n);
+    portENTER_CRITICAL(&s_usb_log_mux);
+    s_usb_log[s_usb_log_wr % USB_LOG_CAP] = e;
+    s_usb_log_wr++;
+    portEXIT_CRITICAL(&s_usb_log_mux);
+}
+
+size_t usb_modes_extra_format_usb_log(char *dst, size_t max_len) {
+    if (!dst || max_len < 32) return 0;
+    usb_log_entry_t snap[USB_LOG_CAP];
+    uint32_t total = 0;
+    portENTER_CRITICAL(&s_usb_log_mux);
+    total = s_usb_log_wr;
+    uint32_t count = (total < USB_LOG_CAP) ? total : USB_LOG_CAP;
+    uint32_t start = total - count;
+    for (uint32_t i = 0; i < count; i++) {
+        snap[i] = s_usb_log[(start + i) % USB_LOG_CAP];
+    }
+    portEXIT_CRITICAL(&s_usb_log_mux);
+
+    size_t off = (size_t)snprintf(dst, max_len, "{\"total\":%lu,\"entries\":[", (unsigned long)total);
+    for (uint32_t i = 0; i < count && off + 80 < max_len; i++) {
+        const usb_log_entry_t *e = &snap[i];
+        char hex[33];
+        uint16_t n = (e->len > 16) ? 16 : e->len;
+        for (uint16_t j = 0; j < n; j++) {
+            snprintf(hex + j * 2, 3, "%02x", e->head[j]);
+        }
+        hex[n * 2] = '\0';
+        off += (size_t)snprintf(dst + off, max_len - off,
+                                "%s{\"ms\":%lu,\"dir\":\"%c\",\"rid\":\"0x%02x\",\"len\":%u,\"hex\":\"%s\"}",
+                                (i > 0) ? "," : "",
+                                (unsigned long)e->ms, e->dir, (unsigned)e->rid, (unsigned)e->len, hex);
+    }
+    off += (size_t)snprintf(dst + off, max_len - off, "]}");
+    return off;
+}
 
 /* ============================================================================
  * Shared Helpers
@@ -306,8 +366,11 @@ static const char *s_switch_string_desc[] = {
 
 static const uint8_t s_switch_config_desc[] = {
     TUD_CONFIG_DESCRIPTOR(1, 1, 0, SW_DESC_TOTAL_LEN, TUSB_DESC_CONFIG_ATT_REMOTE_WAKEUP, 250),
-    /* HID-only (no UAC1) so a real Nintendo Switch recognizes 057e:2009 cleanly */
-    TUD_HID_INOUT_DESCRIPTOR(0, 0, HID_ITF_PROTOCOL_NONE, sizeof(s_switch_report_desc), 0x01, 0x81, 64, 8),
+    /* Authentic Nintendo Switch Pro (057e:2009) layout: HID-only, EP 0x81 IN FIRST, EP 0x02 OUT SECOND */
+    9, TUSB_DESC_INTERFACE, 0, 0, 2, TUSB_CLASS_HID, 0, HID_ITF_PROTOCOL_NONE, 0,
+    9, HID_DESC_TYPE_HID, U16_TO_U8S_LE(0x0111), 0, 1, HID_DESC_TYPE_REPORT, U16_TO_U8S_LE(sizeof(s_switch_report_desc)),
+    7, TUSB_DESC_ENDPOINT, 0x81, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(64), 8,
+    7, TUSB_DESC_ENDPOINT, 0x02, TUSB_XFER_INTERRUPT, U16_TO_U8S_LE(64), 8,
 };
 
 _Static_assert(sizeof(s_switch_config_desc) == SW_DESC_TOTAL_LEN, "s_switch_config_desc size mismatch");
@@ -428,6 +491,13 @@ static void sw_read_spi_flash(uint32_t addr, uint8_t len, uint8_t *dst) {
     static bool    s_spi_inited = false;
     if (!s_spi_inited) {
         memset(s_spi_6000, 0xFF, sizeof(s_spi_6000));
+        /* 0x6000..0x600F: Factory ASCII Serial Number (required by real Switch 1 Horizon OS) */
+        static const char k_serial[16] = "XAW10000000001\0";
+        memcpy(s_spi_6000 + 0x00, k_serial, 16);
+        /* 0x6012: Hardware Device Type (0x03 = Pro Controller) */
+        s_spi_6000[0x12] = 0x03;
+        /* 0x601B: Color presence flag (0x01 = factory body/button colors present) */
+        s_spi_6000[0x1B] = 0x01;
         /* 0x6020..0x6037: IMU factory cal (accel origin=0, 1g coeff=0x4000; gyro origin=0, coeff=13371) */
         static const uint8_t k_imu[24] = {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -484,20 +554,24 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
     }
 
     if (rid == 0x80 && plen >= 1) {
+        usb_log_push('R', rid, p, plen);
         uint8_t sub = p[0];
         uint8_t rep[64];
         memset(rep, 0, sizeof(rep));
         if (sub == 0x01) {
             rep[0] = 0x81; rep[1] = 0x01; rep[2] = 0x00; rep[3] = 0x03; /* Pro Controller */
             for (int i = 0; i < 6; i++) rep[4 + i] = s_mac[5 - i];
+            usb_log_push('T', rep[0], rep + 1, 10);
             sw_enqueue_reply(rep);
             *out_kick_tx = true;
         } else if (sub == 0x02) {
             rep[0] = 0x81; rep[1] = 0x02;
+            usb_log_push('T', rep[0], rep + 1, 4);
             sw_enqueue_reply(rep);
             *out_kick_tx = true;
         } else if (sub == 0x03) {
             rep[0] = 0x81; rep[1] = 0x03;
+            usb_log_push('T', rep[0], rep + 1, 4);
             sw_enqueue_reply(rep);
             *out_kick_tx = true;
         } else if (sub == 0x04) {
@@ -505,6 +579,11 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
             *out_kick_tx = true;
         } else if (sub == 0x05) {
             s_sw_streaming = false;
+        } else if (sub == 0x91 || sub == 0x92) {
+            rep[0] = 0x81; rep[1] = sub;
+            usb_log_push('T', rep[0], rep + 1, 4);
+            sw_enqueue_reply(rep);
+            *out_kick_tx = true;
         }
         return;
     }
@@ -517,6 +596,7 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
     }
 
     if (rid == 0x01 && plen >= 10) {
+        usb_log_push('R', rid, p, plen);
         uint8_t subcmd = p[9];
         const uint8_t *args = (plen > 10) ? (p + 10) : NULL;
         uint16_t arglen = (plen > 10) ? (uint16_t)(plen - 10) : 0;
@@ -528,6 +608,23 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
         rep[14] = subcmd;
 
         switch (subcmd) {
+        case 0x01: /* Bluetooth Manual Pairing (required by real Switch 1 Horizon OS!) */
+            rep[13] = 0x81;
+            if (args && arglen >= 1) {
+                rep[15] = args[0];
+                if (args[0] == 0x01) {
+                    memcpy(rep + 16, s_mac, 6);
+                    static const char k_name[14] = "Pro Controller";
+                    memcpy(rep + 22, k_name, sizeof(k_name));
+                } else if (args[0] == 0x02) {
+                    static const uint8_t k_ltk[16] = {
+                        0x53, 0x54, 0x41, 0x44, 0x49, 0x41, 0x50, 0x52,
+                        0x4F, 0x43, 0x4F, 0x4E, 0x30, 0x30, 0x30, 0x31,
+                    };
+                    memcpy(rep + 16, k_ltk, sizeof(k_ltk));
+                }
+            }
+            break;
         case 0x02: /* Request Device Info */
             rep[13] = 0x82;
             rep[15] = 0x03; rep[16] = 0x8B; /* FW 3.139 */
@@ -539,7 +636,7 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
             break;
         case 0x03: /* Set Input Report Mode */
             rep[13] = 0x80;
-            if (args && arglen >= 1 && args[0] == 0x30) {
+            if (args && arglen >= 1 && (args[0] == 0x30 || args[0] == 0x3F)) {
                 s_sw_streaming = true;
             }
             break;
@@ -558,11 +655,21 @@ static void sw_set_report(uint8_t report_id, const uint8_t *buf, uint16_t len,
                 sw_read_spi_flash(addr, rlen, rep + 20);
             }
             break;
+        case 0x21: /* Set NFC/IR MCU configuration */
+            rep[13] = 0xA0;
+            rep[15] = 0x01; /* MCU status standby */
+            break;
+        case 0x50: /* Get Regulated Voltage (~3.9V) */
+            rep[13] = 0xD0;
+            rep[15] = 0x28;
+            rep[16] = 0x06;
+            break;
         default:
-            /* 0x01, 0x08, 0x21, 0x22, 0x30 (Player LEDs), 0x38 (Home LED), 0x40 (IMU), 0x48 (Vib) */
+            /* 0x08, 0x22, 0x30 (Player LEDs), 0x38 (Home LED), 0x40 (IMU), 0x48 (Vib) */
             rep[13] = 0x80;
             break;
         }
+        usb_log_push('T', rep[0], rep + 13, 14);
         sw_enqueue_reply(rep);
         *out_kick_tx = true;
     }

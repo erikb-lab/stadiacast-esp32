@@ -4,8 +4,10 @@
 #include "ota_updater.h"
 #include "stadia_opus.h"
 #include "stadia_transport.h"
+#include "status_led.h"
 #include "usb_audio.h"
 #include "usb_gamepad.h"
+#include "usb_modes_extra.h"
 #include "wifi_ap.h"
 
 #include <stdbool.h>
@@ -146,6 +148,17 @@ static const char k_index_html[] =
 "<option value=0>0% (Raw)</option><option value=1310>4%</option><option value=2621>8%</option></select></div>"
 "<div class=row><label>Wi-Fi TX Power</label><select id=selTx onchange='postSet({wifi_tx_qdbm:+this.value})'>"
 "<option value=32>+8 dBm (Coolest)</option><option value=44>+11 dBm</option><option value=52>+13 dBm (Default)</option><option value=64>+16 dBm</option><option value=80>+20 dBm (Max Range)</option></select></div>"
+"<div class=row><label>Status LED</label><select id=selLedPre onchange='applyLedPreset(this.value)'>"
+"<option value='0:21'>XIAO ESP32-S3 (GPIO 21, Plain Active-LOW)</option>"
+"<option value='2:48'>SuperMini / DevKitC-1 / S3-Nano (GPIO 48, WS2812 RGB)</option>"
+"<option value='2:21'>Waveshare S3-Zero (GPIO 21, WS2812 RGB)</option>"
+"<option value='2:38'>DevKitC-1 v1.1 (GPIO 38, WS2812 RGB)</option>"
+"<option value='3:21'>Disabled (Off)</option>"
+"<option value='custom'>Custom Pin / Type...</option></select></div>"
+"<div id=ledCust class=row style='display:none'><label>Custom LED</label><select id=selLedType style='min-width:120px'>"
+"<option value=0>GPIO Active-LOW</option><option value=1>GPIO Active-HIGH</option><option value=2>WS2812 RGB</option><option value=3>Disabled</option></select>"
+"<input id=inLedPin type=text maxlength=2 placeholder='GPIO 0..48' style='max-width:90px'>"
+"<button class=sec onclick='saveCustomLed()'>Apply LED</button></div>"
 "<small>Experimental 2–4 Player Co-Op dedicates all 4 hardware USB IN endpoints to independent XInput or Stadia HID gamepads on a single dongle (disables UAC1 USB audio while &gt;1 player is active).</small>"
 "<div id=setMsg class=msg></div></div>"
 
@@ -182,6 +195,7 @@ static const char k_index_html[] =
 "<div class=card><h2>System</h2><div class=row>"
 "<button class=sec onclick='reboot(false)'>Reboot Dongle</button>"
 "<button class=bad onclick='reboot(true)'>Enter USB Bootloader</button>"
+"<a href='/api/usb-log' target=_blank style='color:var(--mut);font-size:.82rem;margin-left:auto'>USB Handshake Log (JSON)</a>"
 "</div><small>USB Bootloader enters ESP32-S3 ROM flash mode without touching the B button (or hold <b>Assistant + Capture + Y</b> for 2 s). <span id=mem></span></small></div>"
 
 "<script>"
@@ -213,6 +227,10 @@ static const char k_index_html[] =
 "document.getElementById('selPlayers').value=mp;"
 "document.getElementById('selGain').value=d.mic_gain_q8;document.getElementById('selDz').value=d.stick_dz;"
 "document.getElementById('selTx').value=d.wifi_tx_qdbm;document.getElementById('apSsid').value=d.ap_ssid;"
+"const lk=(d.led_type??0)+':'+(d.led_gpio??21);const lp=document.getElementById('selLedPre');"
+"if([...lp.options].some(o=>o.value===lk)){lp.value=lk;document.getElementById('ledCust').style.display='none';}"
+"else{lp.value='custom';document.getElementById('ledCust').style.display='flex';}"
+"document.getElementById('selLedType').value=d.led_type??0;document.getElementById('inLedPin').value=d.led_gpio??21;"
 "document.getElementById('selBle').value=d.ble_auto?'1':'0';"
 "document.getElementById('staSsid').value=d.sta_ssid||'';document.getElementById('otaUrl').value=d.ota_url||'';}"
 "}catch(e){}}"
@@ -221,6 +239,10 @@ static const char k_index_html[] =
 "function toggleMute(){postSet({mic_muted:!curMute});}"
 "function saveMode(){postSet({usb_mode:+document.getElementById('selMode').value});}"
 "function savePlayers(){postSet({max_players:+document.getElementById('selPlayers').value});}"
+"function applyLedPreset(v){if(v==='custom'){document.getElementById('ledCust').style.display='flex';return;}"
+"document.getElementById('ledCust').style.display='none';const [t,g]=v.split(':').map(Number);"
+"document.getElementById('selLedType').value=t;document.getElementById('inLedPin').value=g;postSet({led_type:t,led_gpio:g});}"
+"function saveCustomLed(){postSet({led_type:+document.getElementById('selLedType').value,led_gpio:parseInt(document.getElementById('inLedPin').value,10)});}"
 "function saveSta(){postSet({sta_ssid:document.getElementById('staSsid').value.trim(),sta_pass:document.getElementById('staPass').value,ota_url:document.getElementById('otaUrl').value.trim()},'staMsg');}"
 "function saveAp(){postSet({ap_ssid:document.getElementById('apSsid').value.trim(),ap_pass:document.getElementById('apPass').value},'apMsg');}"
 "function resetAp(){if(confirm('Reset SoftAP back to STADIA_ESP32 / stadiacast and reboot?'))postSet({ap_reset:true},'apMsg');}"
@@ -331,6 +353,11 @@ static esp_err_t get_api_status(httpd_req_t *req) {
     cJSON_AddStringToObject(root, "sta_ssid", sta_ssid);
     cJSON_AddStringToObject(root, "ota_url", ota_url);
     cJSON_AddStringToObject(root, "ota_msg", ota_msg);
+    status_led_type_t led_t = STATUS_LED_TYPE_GPIO_ACTIVE_LOW;
+    int8_t led_g = 21;
+    status_led_get_config(&led_t, &led_g);
+    cJSON_AddNumberToObject(root, "led_type", (int)led_t);
+    cJSON_AddNumberToObject(root, "led_gpio", (int)led_g);
     cJSON_AddBoolToObject(root, "ble_auto", ble_provision_get_auto());
     cJSON_AddStringToObject(root, "ble_status", ble_st);
 
@@ -383,6 +410,21 @@ static esp_err_t post_api_settings(httpd_req_t *req) {
     if ((it = cJSON_GetObjectItem(j, "wifi_tx_qdbm")) && cJSON_IsNumber(it)) {
         wifi_ap_set_tx_power((int8_t)it->valueint);
         msg = "Wi-Fi TX power updated";
+    }
+    if (cJSON_GetObjectItem(j, "led_type") || cJSON_GetObjectItem(j, "led_gpio")) {
+        status_led_type_t lt = STATUS_LED_TYPE_GPIO_ACTIVE_LOW;
+        int8_t lg = 21;
+        status_led_get_config(&lt, &lg);
+        cJSON *jt = cJSON_GetObjectItem(j, "led_type");
+        cJSON *jg = cJSON_GetObjectItem(j, "led_gpio");
+        if (jt && cJSON_IsNumber(jt)) lt = (status_led_type_t)jt->valueint;
+        if (jg && cJSON_IsNumber(jg)) lg = (int8_t)jg->valueint;
+        if (!status_led_configure(lt, lg)) {
+            cJSON_Delete(j);
+            return send_json(req, "400 Bad Request",
+                             "{\"ok\":false,\"msg\":\"Invalid or reserved LED GPIO (avoid USB 19/20 and flash/PSRAM pins)\"}");
+        }
+        msg = "Status LED updated (saved)";
     }
     if ((it = cJSON_GetObjectItem(j, "ble_auto")) && cJSON_IsBool(it)) {
         ble_provision_set_auto(cJSON_IsTrue(it));
@@ -466,6 +508,9 @@ static esp_err_t post_api_ota(httpd_req_t *req) {
     if (!buf) return send_json(req, "500 Internal Server Error", "{\"ok\":false,\"msg\":\"OOM\"}");
 
     ESP_LOGI(TAG, "Browser OTA start: %d bytes -> %s", total, part->label);
+    /* Pause BLE auto-scanning during Wi-Fi OTA so the shared 2.4 GHz radio
+     * isn't pulled off Wi-Fi mid-upload. */
+    ble_provision_pause_for_wifi_ms(180000);
     esp_ota_handle_t handle = 0;
     bool began = false;
     int remaining = total;
@@ -630,11 +675,21 @@ static esp_err_t post_api_reboot(httpd_req_t *req) {
     return rc;
 }
 
+static esp_err_t get_api_usb_log(httpd_req_t *req) {
+    char *buf = malloc(3200);
+    if (!buf) return send_json(req, "500 Internal Server Error", "{\"ok\":false}");
+    usb_modes_extra_format_usb_log(buf, 3200);
+    esp_err_t rc = send_json(req, "200 OK", buf);
+    free(buf);
+    return rc;
+}
+
 void web_ui_register(httpd_handle_t server) {
     static const httpd_uri_t routes[] = {
         { .uri = "/",             .method = HTTP_GET,  .handler = get_root },
         { .uri = "/api/status",   .method = HTTP_GET,  .handler = get_api_status },
         { .uri = "/api/input",    .method = HTTP_GET,  .handler = get_api_input },
+        { .uri = "/api/usb-log",  .method = HTTP_GET,  .handler = get_api_usb_log },
         { .uri = "/api/settings", .method = HTTP_POST, .handler = post_api_settings },
         { .uri = "/api/ota",      .method = HTTP_POST, .handler = post_api_ota },
         { .uri = "/api/ota-sta",  .method = HTTP_POST, .handler = post_api_ota_sta },
